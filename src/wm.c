@@ -385,6 +385,12 @@ struct desk_toplevel {
 	int outer_w, outer_h;
 	int maximized;
 	int saved_x, saved_y, saved_inner_w, saved_inner_h;
+	/* laid to a part of its screen (view_tile): where it was before, to
+	 * go back to, and which half it was sent to and how wide, to step on
+	 * from there when the same key is pressed again */
+	bool tiled;
+	int tile_x, tile_y, tile_inner_w, tile_inner_h;
+	int tile_side, tile_step;
 	/* No frame of ours: the client draws its own (or asks for none), or
 	 * it has the whole screen. The client then starts at the sheet's
 	 * corner, and the paper is only as big as the client. */
@@ -12448,6 +12454,166 @@ static void view_toggle_max_now(struct desk_toplevel *view)
 	}
 }
 
+/* ---- sheets laid side by side ----
+ *
+ * Super+Left and Super+Right lay the sheet in front against that side of
+ * its screen, half of it wide; pressed again, two thirds, then one third.
+ * Super+1 to Super+5 lay out the sheets on that screen, the front one
+ * first: 1 the whole of it, 2 halves (1:1), 3 two thirds and a third
+ * (2:1), 4 quarters, 5 thirds side by side. Super+Down puts the front one
+ * back where it was before, Super+0 all of them. The part of a screen
+ * that is used is what a sheet opened out would have: on the desk's own,
+ * all but the tray. */
+
+#define TILE_GAP 6
+
+static bool tile_can(const struct desk_toplevel *v)
+{
+	return v->scene_tree && v->scene_tree->node.enabled && !v->unmanaged && !v->ime_popup
+		&& !v->fullscreen && v->sheet.phase == SHEET_IDLE && v->outer_w > 0
+		&& v->outer_h > 0;
+}
+
+/* the part of a (from x0, y0 to x1, y1, as fractions of it), with a gap
+ * where it meets another part */
+static struct wlr_box tile_part(struct wlr_box a, double x0, double y0, double x1, double y1)
+{
+	int g = TILE_GAP / 2;
+	int l = a.x + (int)lround(a.width * x0) + (x0 > 0.0 ? g : 0);
+	int t = a.y + (int)lround(a.height * y0) + (y0 > 0.0 ? g : 0);
+	int r = a.x + (int)lround(a.width * x1) - (x1 < 1.0 ? g : 0);
+	int b = a.y + (int)lround(a.height * y1) - (y1 < 1.0 ? g : 0);
+	return (struct wlr_box){ l, t, r - l, b - t };
+}
+
+/* view laid into box (paper and all), its place before kept the first time */
+static void view_tile(struct desk_toplevel *view, struct wlr_box box)
+{
+	int l, t, r, b;
+	view_insets(view, &l, &t, &r, &b);
+	if (view->maximized) {
+		/* the place before it was opened out is the one to go back to */
+		view_set_maximized(view, false);
+		view->maximized = 0;
+		if (!view->tiled) {
+			view->tile_x = view->saved_x;
+			view->tile_y = view->saved_y;
+			view->tile_inner_w = view->saved_inner_w;
+			view->tile_inner_h = view->saved_inner_h;
+		}
+	} else if (!view->tiled) {
+		view->tile_x = view->scene_tree->node.x;
+		view->tile_y = view->scene_tree->node.y;
+		view->tile_inner_w = view->outer_w - l - r;
+		view->tile_inner_h = view->outer_h - t - b;
+	}
+	view->tiled = true;
+	int iw = box.width - l - r, ih = box.height - t - b;
+	iw = iw < 120 ? 120 : iw;
+	ih = ih < 80 ? 80 : ih;
+	wlr_scene_node_set_position(&view->scene_tree->node, box.x, box.y);
+	view_set_size(view, iw, ih);
+	view_sync_shadow(view);
+	view_send_position(view);
+}
+
+static void view_untile(struct desk_toplevel *view)
+{
+	if (!view->tiled || !view->scene_tree) {
+		return;
+	}
+	view->tiled = false;
+	view->tile_step = 0;
+	int l, t, r, b;
+	view_insets(view, &l, &t, &r, &b);
+	wlr_scene_node_set_position(&view->scene_tree->node, view->tile_x,
+		work_clamp_y(view->server, view->tile_x + (view->tile_inner_w + l + r) / 2,
+			view->tile_y));
+	view_set_size(view, view->tile_inner_w, view->tile_inner_h);
+	view_sync_shadow(view);
+	view_send_position(view);
+}
+
+/* the sheet in front, if it can be laid anywhere */
+static struct desk_toplevel *tile_front(struct desk_server *server)
+{
+	struct desk_toplevel *v;
+	wl_list_for_each(v, &server->toplevels, link) {
+		if (tile_can(v)) {
+			return v;
+		}
+	}
+	return NULL;
+}
+
+/* Super+Left (side -1) or Super+Right (side 1) */
+static void tile_side(struct desk_server *server, int side)
+{
+	static const double width[] = { 1.0 / 2.0, 2.0 / 3.0, 1.0 / 3.0 };
+	struct desk_toplevel *view = tile_front(server);
+	struct wlr_output *out = view ? view_screen(view) : NULL;
+	if (!out) {
+		return;
+	}
+	int step = view->tiled && view->tile_side == side ? (view->tile_step + 1) % 3 : 0;
+	double w = width[step];
+	struct wlr_box a = max_area(server, out);
+	view_tile(view, side < 0 ? tile_part(a, 0.0, 0.0, w, 1.0)
+		: tile_part(a, 1.0 - w, 0.0, 1.0, 1.0));
+	view->tile_side = side;
+	view->tile_step = step;
+}
+
+/* Super+1 to Super+5: the sheets on the front one's screen laid out */
+static void tile_scheme(struct desk_server *server, int scheme)
+{
+	static const double cells[5][4][4] = {
+		{ { 0, 0, 1, 1 } },
+		{ { 0, 0, 0.5, 1 }, { 0.5, 0, 1, 1 } },
+		{ { 0, 0, 2.0 / 3.0, 1 }, { 2.0 / 3.0, 0, 1, 1 } },
+		{ { 0, 0, 0.5, 0.5 }, { 0.5, 0, 1, 0.5 }, { 0, 0.5, 0.5, 1 }, { 0.5, 0.5, 1, 1 } },
+		{ { 0, 0, 1.0 / 3.0, 1 }, { 1.0 / 3.0, 0, 2.0 / 3.0, 1 }, { 2.0 / 3.0, 0, 1, 1 } },
+	};
+	static const int count[5] = { 1, 2, 2, 4, 3 };
+	if (scheme < 1 || scheme > 5) {
+		return;
+	}
+	struct desk_toplevel *front = tile_front(server);
+	struct wlr_output *out = front ? view_screen(front) : NULL;
+	if (!out) {
+		return;
+	}
+	struct wlr_box a = max_area(server, out);
+	/* front first, as they lie: who first, then where */
+	struct desk_toplevel *take[4];
+	int n = 0;
+	struct desk_toplevel *v;
+	wl_list_for_each(v, &server->toplevels, link) {
+		if (n < count[scheme - 1] && tile_can(v) && view_screen(v) == out) {
+			take[n++] = v;
+		}
+	}
+	for (int i = 0; i < n; i++) {
+		const double *c = cells[scheme - 1][i];
+		view_tile(take[i], tile_part(a, c[0], c[1], c[2], c[3]));
+		take[i]->tile_side = 0;
+		take[i]->tile_step = 0;
+	}
+	wlr_log(WLR_INFO, "tile: scheme %d, %d sheet%s on %s", scheme, n, n == 1 ? "" : "s",
+		out->name);
+}
+
+/* Super+0: every sheet laid out goes back where it was */
+static void tile_all_back(struct desk_server *server)
+{
+	struct desk_toplevel *v;
+	wl_list_for_each(v, &server->toplevels, link) {
+		if (v->tiled && tile_can(v)) {
+			view_untile(v);
+		}
+	}
+}
+
 /* The tray is only known for certain once the room is traced, and moves
  * when the screen changes shape. Then: any window that has ended up on it
  * comes down off it, a maximised one fits what there is now, and X is told
@@ -16033,6 +16199,37 @@ static bool handle_keybinding(struct desk_server *server, xkb_keysym_t sym, uint
 				struct desk_toplevel *view = wl_container_of(server->toplevels.next, view, link);
 				view_fold_toggle(view);
 			}
+			return true;
+		case XKB_KEY_Left:
+		case XKB_KEY_Right:
+			tile_side(server, sym == XKB_KEY_Left ? -1 : 1);
+			return true;
+		case XKB_KEY_Up: {
+			struct desk_toplevel *front = tile_front(server);
+			if (front && !front->maximized) {
+				front->tiled = false;
+				view_toggle_max(front);
+			}
+			return true;
+		}
+		case XKB_KEY_Down: {
+			struct desk_toplevel *front = tile_front(server);
+			if (front && front->maximized) {
+				view_toggle_max(front);
+			} else if (front) {
+				view_untile(front);
+			}
+			return true;
+		}
+		case XKB_KEY_1:
+		case XKB_KEY_2:
+		case XKB_KEY_3:
+		case XKB_KEY_4:
+		case XKB_KEY_5:
+			tile_scheme(server, (int)(sym - XKB_KEY_0));
+			return true;
+		case XKB_KEY_0:
+			tile_all_back(server);
 			return true;
 		case XKB_KEY_d:
 		case XKB_KEY_D:
