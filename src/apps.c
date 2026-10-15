@@ -1315,6 +1315,67 @@ void desk_apps_rescan(void)
 	do_scan();
 }
 
+void desk_apps_rescan_async(void)
+{
+	/* one scan at a time: they share the locale and the user's own list */
+	desk_apps_finish();
+	if (pthread_create(&g_worker, NULL, worker, NULL) == 0) {
+		g_worker_live = true;
+	} else {
+		do_scan();
+	}
+}
+
+/* the folders do_scan reads, each with when it last changed, run
+ * together: a folder's time moves when an entry is added to it, taken
+ * out or put in place of another (as a package manager does) */
+static unsigned long long stamp_dir(unsigned long long h, const char *dir)
+{
+	struct stat st;
+	unsigned long long t = 0;
+	if (stat(dir, &st) == 0) {
+		t = (unsigned long long)st.st_mtim.tv_sec * 1000000000ull
+			+ (unsigned long long)st.st_mtim.tv_nsec;
+	}
+	for (const char *c = dir; *c; c++) {
+		h = (h ^ (unsigned char)*c) * 1099511628211ull;
+	}
+	return (h ^ t) * 1099511628211ull;
+}
+
+unsigned long long desk_apps_dirs_stamp(void)
+{
+	unsigned long long h = 14695981039346656037ull;
+	char path[1088];
+	const char *dh = getenv("XDG_DATA_HOME");
+	const char *home = getenv("HOME");
+	if (dh && *dh) {
+		snprintf(path, sizeof path, "%s/applications", dh);
+		h = stamp_dir(h, path);
+	} else if (home) {
+		snprintf(path, sizeof path, "%s/.local/share/applications", home);
+		h = stamp_dir(h, path);
+	}
+	const char *dirs = getenv("XDG_DATA_DIRS");
+	if (!dirs || !*dirs) {
+		dirs = "/usr/local/share:/usr/share";
+	}
+	char buf[1024];
+	str_copy(buf, sizeof buf, dirs);
+	for (char *p = buf; p && *p; ) {
+		char *e = strchr(p, ':');
+		if (e) {
+			*e = '\0';
+		}
+		if (*p) {
+			snprintf(path, sizeof path, "%s/applications", p);
+			h = stamp_dir(h, path);
+		}
+		p = e ? e + 1 : NULL;
+	}
+	return h;
+}
+
 void desk_apps_finish(void)
 {
 	if (g_worker_live) {

@@ -88,6 +88,12 @@ void desk_apps_finish(void);
  * locale's). Set before the first scan; after it, rescan. */
 void desk_apps_set_language(const char *code);
 void desk_apps_rescan(void);
+/* Read them all again on a thread of their own, for programs installed or
+ * taken away; the new list is there when its generation has moved on. */
+void desk_apps_rescan_async(void);
+/* Something that changes whenever a program's entry is put into or taken
+ * out of any of the folders they are read from (their times, together). */
+unsigned long long desk_apps_dirs_stamp(void);
 void desk_apps_shutdown(void);
 
 /* Borrow the current snapshot. Never NULL once init has been called; before
