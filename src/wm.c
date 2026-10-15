@@ -1244,6 +1244,13 @@ struct desk_server {
 	/* the laptop's lid: shut, the screen in it is turned off while there
 	 * is another to work on (lid_apply) */
 	bool lid_closed;
+	/* programs installed or taken away (apps_poll): the folders' stamp
+	 * last seen, when it last moved, whether a scan is owed for it, and
+	 * the generation of the list last drawn */
+	unsigned long long apps_stamp;
+	double apps_moved_at, apps_looked_at;
+	bool apps_owed;
+	unsigned apps_gen;
 	/* the screens set out some other way: the bare desk on the ones beside
 	 * the desk's, and the windows on a screen that has gone put on one
 	 * that is there -- once, after all of a change (screens_idle_cb) */
@@ -10439,6 +10446,43 @@ static int gfx_wanted(const struct desk_server *server)
 	return server->on_cpu && !c->gfx_own ? DESK_GFX_2D : c->gfx;
 }
 
+/* Programs installed or taken away while the desk is up: their entries'
+ * folders are looked at once a second, and once a change has settled (a
+ * package manager puts in several, one after another) they are all read
+ * again on a thread of their own. The shelf, the binders, the index and
+ * the drawer are drawn from the new list once it is there: they know it
+ * by its generation. */
+static void apps_poll(struct desk_server *server)
+{
+	double now = monotonic_sec();
+	if (now - server->apps_looked_at < 1.0) {
+		return;
+	}
+	server->apps_looked_at = now;
+	unsigned long long stamp = desk_apps_dirs_stamp();
+	if (stamp != server->apps_stamp) {
+		/* the first look is only where it starts from */
+		server->apps_owed = server->apps_stamp != 0;
+		server->apps_stamp = stamp;
+		server->apps_moved_at = now;
+		return;
+	}
+	if (server->apps_owed && now - server->apps_moved_at >= 2.0) {
+		server->apps_owed = false;
+		wlr_log(WLR_INFO, "programs: some installed or taken away; read again");
+		desk_apps_rescan_async();
+	}
+	const struct desk_app_list *l = desk_apps_acquire();
+	unsigned gen = l->generation;
+	desk_apps_release(l);
+	if (gen != server->apps_gen) {
+		if (server->apps_gen != 0) {
+			server_schedule_frames(server);
+		}
+		server->apps_gen = gen;
+	}
+}
+
 /* Once a second: read again if it has changed since it was last read. */
 static void shell_conf_poll(struct desk_server *server)
 {
@@ -15895,6 +15939,7 @@ static int tick_cb(void *data)
 	clock_tick(server);
 	base_timeouts(server);
 	shell_conf_poll(server);
+	apps_poll(server);
 	/* The clock and the calendar live on the bookcase shelf now, and the
 	 * shelf is only repainted when something about it changes -- and while
 	 * you are looking at it, ten times a second. The seconds hand is
