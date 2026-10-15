@@ -8623,6 +8623,10 @@ static void curl_draw(cairo_t *cr, double B, double s, double open, double lift,
 			double a = show * (hot == i ? 0.98 : 0.80);
 			double z = fs * 0.92;
 			cairo_set_source_rgba(cr, ir, ig, ib, a);
+			if (glyphs[i] < 0) {
+				/* a row drawn by the caller (a sheet's layouts) */
+				continue;
+			}
 			curl_glyph(cr, glyphs[i], x, base - z * 0.92, z);
 			double wx = x + z * 1.45;
 			double fsz = fs;
@@ -8668,12 +8672,76 @@ static void curl_draw(cairo_t *cr, double B, double s, double open, double lift,
 	cairo_restore(cr);
 }
 
+/* The row of layouts, nearest the tip where the back is widest: where
+ * layout k is drawn, a little screen the height of a capital and a half. */
+#define CURL_ROWS (DESK_CURL_ITEMS + 1)
+static bool curl_layout_cell(double B, double s, double open, int k,
+	double *x, double *y, double *w, double *h)
+{
+	double x0, base, fs, room;
+	curl_item_at(B, s, open, CURL_ROWS - 1, CURL_ROWS, &x0, &base, &fs, &room);
+	double ch = fs * 1.15, cw = ch * 1.6;
+	double gap = (room - DESK_CURL_LAYOUTS * cw) / (DESK_CURL_LAYOUTS - 1);
+	if (gap < cw * 0.25) {
+		/* a narrow flap: the screens smaller, so that all four fit */
+		double k2 = room / (DESK_CURL_LAYOUTS * cw + (DESK_CURL_LAYOUTS - 1) * cw * 0.25);
+		cw *= k2;
+		ch *= k2;
+		gap = cw * 0.25;
+	}
+	gap = fmin(gap, cw * 0.55);
+	*w = cw;
+	*h = ch;
+	*x = x0 + k * (cw + gap);
+	*y = base - ch + fs * 0.12;
+	return cw > 4.0;
+}
+
+/* layout k drawn small: the screen, the parts of it the sheets go to, the
+ * one this sheet goes to shaded in with the pencil */
+static void curl_layout_glyph(cairo_t *cr, int k, double x, double y, double w, double h,
+	double a)
+{
+	static const double cells[DESK_CURL_LAYOUTS][4][4] = {
+		{ { 0, 0, 0.5, 1 }, { 0.5, 0, 1, 1 } },
+		{ { 0, 0, 2.0 / 3.0, 1 }, { 2.0 / 3.0, 0, 1, 1 } },
+		{ { 0, 0, 0.5, 0.5 }, { 0.5, 0, 1, 0.5 }, { 0, 0.5, 0.5, 1 }, { 0.5, 0.5, 1, 1 } },
+		{ { 0, 0, 1.0 / 3.0, 1 }, { 1.0 / 3.0, 0, 2.0 / 3.0, 1 }, { 2.0 / 3.0, 0, 1, 1 } },
+	};
+	static const int count[DESK_CURL_LAYOUTS] = { 2, 2, 4, 3 };
+	cairo_save(cr);
+	const double *c = cells[k][0];
+	cairo_rectangle(cr, x + w * c[0], y + h * c[1], w * (c[2] - c[0]), h * (c[3] - c[1]));
+	cairo_set_source_rgba(cr, 0.24, 0.20, 0.15, a * 0.30);
+	cairo_fill(cr);
+	cairo_set_source_rgba(cr, 0.24, 0.20, 0.15, a);
+	cairo_set_line_width(cr, fmax(1.0, h * 0.09));
+	cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+	cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+	desk_rounded_path(cr, x, y, w, h, h * 0.12);
+	cairo_stroke(cr);
+	for (int i = 1; i < count[k]; i++) {
+		const double *e = cells[k][i];
+		/* each part's left and top edge, where it is not the screen's */
+		if (e[0] > 0.0) {
+			cairo_move_to(cr, x + w * e[0], y + h * e[1]);
+			cairo_line_to(cr, x + w * e[0], y + h * e[3]);
+		}
+		if (e[1] > 0.0) {
+			cairo_move_to(cr, x + w * e[0], y + h * e[1]);
+			cairo_line_to(cr, x + w * e[2], y + h * e[1]);
+		}
+	}
+	cairo_stroke(cr);
+	cairo_restore(cr);
+}
+
 void desk_draw_curl(cairo_t *cr, double B, double s, double open, double lift,
 	int hot, bool maximized, const char *title)
 {
-	const char *words[DESK_CURL_ITEMS];
-	int glyphs[DESK_CURL_ITEMS];
-	bool warns[DESK_CURL_ITEMS];
+	const char *words[CURL_ROWS];
+	int glyphs[CURL_ROWS];
+	bool warns[CURL_ROWS];
 	for (int i = 0; i < DESK_CURL_ITEMS; i++) {
 		words[i] = TR(CURL_WORDS[i]);
 		glyphs[i] = i;
@@ -8682,8 +8750,36 @@ void desk_draw_curl(cairo_t *cr, double B, double s, double open, double lift,
 	if (maximized) {
 		words[DESK_CURL_UNFOLD] = TR("Refold");
 	}
-	curl_draw(cr, B, s, open, lift, hot, title_seed(title), DESK_CURL_ITEMS, words, glyphs,
-		warns);
+	/* the last row has no word: the layouts are drawn there below */
+	words[CURL_ROWS - 1] = "";
+	glyphs[CURL_ROWS - 1] = -1;
+	warns[CURL_ROWS - 1] = false;
+	curl_draw(cr, B, s, open, lift, hot < DESK_CURL_ITEMS ? hot : -1, title_seed(title),
+		CURL_ROWS, words, glyphs, warns);
+	double show = clampf((s / fmax(open, 1.0) - 0.62) / 0.30, 0.0, 1.0);
+	if (show <= 0.0 || s < 0.5) {
+		return;
+	}
+	for (int k = 0; k < DESK_CURL_LAYOUTS; k++) {
+		double x, y, w, h;
+		if (!curl_layout_cell(B, s, open, k, &x, &y, &w, &h)) {
+			break;
+		}
+		bool on = hot == DESK_CURL_LAYOUT + k;
+		curl_layout_glyph(cr, k, x, y, w, h, show * (on ? 0.98 : 0.80));
+		if (on) {
+			/* underlined in pencil, as a word would be */
+			cairo_save(cr);
+			cairo_set_line_width(cr, 1.3);
+			cairo_set_source_rgba(cr, 0.28, 0.26, 0.24, 0.70 * show);
+			double uy = y + h + h * 0.30;
+			cairo_move_to(cr, x - 1.0, uy);
+			cairo_curve_to(cr, x + w * 0.3, uy + h * 0.06, x + w * 0.7, uy - h * 0.08,
+				x + w + 2.0, uy);
+			cairo_stroke(cr);
+			cairo_restore(cr);
+		}
+	}
 }
 
 static int curl_hit_n(double B, double s, double open, int n, double lx, double ly)
@@ -8705,7 +8801,22 @@ static int curl_hit_n(double B, double s, double open, int n, double lx, double 
 
 int desk_curl_hit(double B, double s, double open, double lx, double ly)
 {
-	return curl_hit_n(B, s, open, DESK_CURL_ITEMS, lx, ly);
+	int row = curl_hit_n(B, s, open, CURL_ROWS, lx, ly);
+	if (row != CURL_ROWS - 1) {
+		return row;
+	}
+	/* the layouts: which little screen, give or take half the gap */
+	for (int k = 0; k < DESK_CURL_LAYOUTS; k++) {
+		double x, y, w, h;
+		if (!curl_layout_cell(B, s, open, k, &x, &y, &w, &h)) {
+			break;
+		}
+		double m = w * 0.14;
+		if (lx >= x - m && lx <= x + w + m && ly >= y - h * 0.5 && ly <= y + h * 1.5) {
+			return DESK_CURL_LAYOUT + k;
+		}
+	}
+	return -1;
 }
 
 bool desk_curl_contains(double B, double s, double lx, double ly)
