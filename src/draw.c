@@ -12759,9 +12759,10 @@ static void binder_label_face(cairo_t *cr, double w, double h,
 	cairo_rectangle(cr, w * 0.10, h * 0.09, w * 0.80, h * 0.82);
 	cairo_stroke(cr);
 
-	/* typed smaller for a long name (Développement): the card is no wider */
-	show_text_fit_to(cr, DESK_FONT_TYPE, name, w * 0.5, h * 0.42, h * 0.125, true,
-		0.16, 0.12, 0.09, 0.95, 0, w * 0.72, 0.35);
+	/* typed smaller for a long name (Développement): the card is no wider.
+	 * Large and dark enough to be read across the room. */
+	show_text_fit_to(cr, DESK_FONT_TYPE, name, w * 0.5, h * 0.42, h * 0.17, true,
+		0.08, 0.06, 0.04, 1.0, 0, w * 0.76, 0.35);
 
 	wobble_line(cr, w * 0.20, h * 0.60, w * 0.80, h * 0.60, seed, 3, 0.5, 1.0,
 		0.30, 0.22, 0.15, 0.55);
@@ -12774,10 +12775,11 @@ static void binder_label_face(cairo_t *cr, double w, double h,
 	cairo_identity_matrix(cr);
 
 	/* the ribbon, over everything that was typed with it */
+	/* (only a touch of it: the name has to be read from the desk) */
 	ink_skip(cr, w * 0.10, h * 0.16, w * 0.80, h * 0.44, seed + 3,
-		0.30 + years * 0.26, 0.876, 0.842, 0.762);
+		0.05 + years * 0.06, 0.876, 0.842, 0.762);
 	ink_skip(cr, w * 0.30, h * 0.66, w * 0.40, h * 0.24, seed + 9,
-		0.20 + years * 0.18, 0.876, 0.842, 0.762);
+		0.05 + years * 0.06, 0.876, 0.842, 0.762);
 
 	/* the thumb that takes this binder down, always in the same place */
 	double tx = hash21(seed, 19.7) > 0.5 ? w * 0.26 : w * 0.74;
