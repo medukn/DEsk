@@ -471,6 +471,8 @@ struct desk_toplevel {
 	/* Wayland: an input method's own window (ime_window_is) -- the same,
 	 * but put where the text being written is, which it cannot say */
 	bool ime_popup;
+	/* folded by Super+Shift+M, so pressed again it is opened back out */
+	bool folded_by_all;
 	bool associated;
 	struct wl_listener associate;
 	struct wl_listener dissociate;
@@ -10720,6 +10722,52 @@ static void view_fold_toggle(struct desk_toplevel *view)
 	}
 }
 
+/* Super+Shift+M: every sheet on the desk folded at once; pressed again,
+ * the ones it folded opened back out (or, if it folded none, every one
+ * folded on the desk). Those in the drawer stay there. */
+static bool fold_all_can(const struct desk_toplevel *view)
+{
+	return view->scene_tree && !view->unmanaged && !view->ime_popup;
+}
+
+static void fold_all_toggle(struct desk_server *server)
+{
+	int n = wl_list_length(&server->toplevels);
+	if (n <= 0) {
+		return;
+	}
+	/* folding moves the keys, and the list with them: who first, then do */
+	struct desk_toplevel **views = calloc((size_t)n, sizeof *views);
+	if (!views) {
+		return;
+	}
+	int k = 0;
+	bool open = false, marked = false;
+	struct desk_toplevel *view;
+	wl_list_for_each(view, &server->toplevels, link) {
+		if (k < n && fold_all_can(view)) {
+			views[k++] = view;
+			open |= view->sheet.phase == SHEET_IDLE;
+			marked |= view->folded_by_all && view->sheet.phase == SHEET_PARKED
+				&& !view->sheet.in_drawer;
+		}
+	}
+	for (int i = 0; i < k; i++) {
+		view = views[i];
+		if (open) {
+			view->folded_by_all = view->sheet.phase == SHEET_IDLE;
+			if (view->folded_by_all) {
+				view_fold_toggle(view);
+			}
+		} else if (view->sheet.phase == SHEET_PARKED && !view->sheet.in_drawer
+				&& (view->folded_by_all || !marked)) {
+			view->folded_by_all = false;
+			view_fold_toggle(view);
+		}
+	}
+	free(views);
+}
+
 /* ---- what is in the drawer ---------------------------------------
  *
  * Whatever has been put there, in a row along the felt: programs, the
@@ -16029,7 +16077,9 @@ static bool handle_keybinding(struct desk_server *server, xkb_keysym_t sym, uint
 			return true;
 		case XKB_KEY_m:
 		case XKB_KEY_M:
-			if (!wl_list_empty(&server->toplevels)) {
+			if (mods & WLR_MODIFIER_SHIFT) {
+				fold_all_toggle(server);
+			} else if (!wl_list_empty(&server->toplevels)) {
 				struct desk_toplevel *view = wl_container_of(server->toplevels.next, view, link);
 				view_fold_toggle(view);
 			}
