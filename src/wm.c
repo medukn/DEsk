@@ -65,6 +65,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -106,6 +107,7 @@
 #include <wlr/types/wlr_xdg_output_v1.h>
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_subcompositor.h>
+#include <wlr/types/wlr_switch.h>
 #include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/types/wlr_server_decoration.h>
@@ -349,6 +351,10 @@ struct desk_output {
 	 * window on the other desktop is not ours to turn off, the black laid
 	 * over it instead and whether that has been shown yet. */
 	bool off, dark, dark_shown;
+	/* Turned off because the lid is shut over it while another screen is
+	 * on (lid_apply): the lid opened, it comes on again. Not one turned off
+	 * from a display tool, which stays off. */
+	bool lid_off;
 	struct wlr_output_mode *dark_mode;
 	int dark_w, dark_h, dark_refresh;
 	struct wlr_scene_rect *dark_cover;
@@ -1221,6 +1227,9 @@ struct desk_server {
 	/* the screens set out again as displays.conf has them, once the ones
 	 * that are coming have all come (see "the screens as they were left") */
 	struct wl_event_source *disp_idle;
+	/* the laptop's lid: shut, the screen in it is turned off while there
+	 * is another to work on (lid_apply) */
+	bool lid_closed;
 	/* the screens set out some other way: the bare desk on the ones beside
 	 * the desk's, and the windows on a screen that has gone put on one
 	 * that is there -- once, after all of a change (screens_idle_cb) */
@@ -17195,14 +17204,12 @@ static struct desk_output *desk_output_of(struct desk_server *server, struct wlr
 	return NULL;
 }
 
-static void om_publish(struct desk_server *server)
+/* How the screens are set out now, as a display tool is told it. */
+static struct wlr_output_configuration_v1 *om_config_now(struct desk_server *server)
 {
-	if (!server->om || server->quitting) {
-		return;
-	}
 	struct wlr_output_configuration_v1 *config = wlr_output_configuration_v1_create();
 	if (!config) {
-		return;
+		return NULL;
 	}
 	struct desk_output *o;
 	wl_list_for_each(o, &server->outputs, link) {
@@ -17227,7 +17234,18 @@ static void om_publish(struct desk_server *server)
 			head->state.y = box.y;
 		}
 	}
-	wlr_output_manager_v1_set_configuration(server->om, config);
+	return config;
+}
+
+static void om_publish(struct desk_server *server)
+{
+	if (!server->om || server->quitting) {
+		return;
+	}
+	struct wlr_output_configuration_v1 *config = om_config_now(server);
+	if (config) {
+		wlr_output_manager_v1_set_configuration(server->om, config);
+	}
 }
 
 /* The head for the screen the desk will be on: the one put at the corner,
@@ -17724,6 +17742,8 @@ static struct wlr_output_mode *disp_mode(struct wlr_output *out, const struct di
 	return best;
 }
 
+static void lid_apply(struct desk_server *server);
+
 /* The screens set out as displays.conf keeps them for this set of them,
  * if it keeps them and they are not so already. */
 static void displays_put_back(struct desk_server *server)
@@ -17798,6 +17818,7 @@ static void displays_idle_cb(void *data)
 	struct desk_server *server = data;
 	server->disp_idle = NULL;
 	displays_put_back(server);
+	lid_apply(server);
 }
 
 /* The screens have changed -- the first of them have come, one has been
@@ -17810,6 +17831,167 @@ static void displays_changed(struct desk_server *server)
 	}
 	server->disp_idle = wl_event_loop_add_idle(wl_display_get_event_loop(server->wl_display),
 		displays_idle_cb, server);
+}
+
+/* ---- the lid ----
+ *
+ * A laptop shut on a dock: the screen in its lid cannot be seen, so it is
+ * turned off while another screen is on, and the desk goes over to one
+ * that is left, as when a display tool turns it off. Opened, it comes on
+ * again beside the others, the desk staying where it is. With no other
+ * screen on -- the dock taken away -- it is never left off: what to do
+ * about a shut lid then is logind's (it suspends). */
+
+/* Is out the screen built into the laptop? */
+static bool output_is_panel(const struct wlr_output *out)
+{
+	return strncmp(out->name, "eDP", 3) == 0 || strncmp(out->name, "LVDS", 4) == 0
+		|| strncmp(out->name, "DSI", 3) == 0;
+}
+
+/* Whether the lid is shut, as the kernel has it, for the start: libinput
+ * says so too, but only once its switch has come. */
+static bool lid_read_closed(void)
+{
+	DIR *d = opendir("/proc/acpi/button/lid");
+	if (!d) {
+		return false;
+	}
+	bool closed = false;
+	struct dirent *e;
+	while (!closed && (e = readdir(d))) {
+		if (e->d_name[0] == '.') {
+			continue;
+		}
+		char path[512], line[128];
+		snprintf(path, sizeof path, "/proc/acpi/button/lid/%s/state", e->d_name);
+		FILE *f = fopen(path, "re");
+		if (!f) {
+			continue;
+		}
+		if (fgets(line, sizeof line, f) && strstr(line, "closed")) {
+			closed = true;
+		}
+		fclose(f);
+	}
+	closedir(d);
+	return closed;
+}
+
+static void lid_apply(struct desk_server *server)
+{
+	if (server->quitting || server->headless || wl_list_empty(&server->outputs)) {
+		return;
+	}
+	bool other = false;
+	struct desk_output *o;
+	wl_list_for_each(o, &server->outputs, link) {
+		if (!output_is_panel(o->wlr_output) && !o->off) {
+			other = true;
+		}
+	}
+	bool shut = server->lid_closed && other;
+	bool change = false;
+	wl_list_for_each(o, &server->outputs, link) {
+		if (output_is_panel(o->wlr_output)
+			&& (shut ? !o->off : o->lid_off)) {
+			change = true;
+		}
+	}
+	if (!change) {
+		return;
+	}
+	struct wlr_output_configuration_v1 *config = om_config_now(server);
+	if (!config) {
+		return;
+	}
+	/* one coming on again goes to the right of the rest */
+	int right = 0;
+	struct wlr_output_configuration_head_v1 *head;
+	wl_list_for_each(head, &config->heads, link) {
+		const struct wlr_output_head_v1_state *s = &head->state;
+		struct wlr_box box;
+		wlr_output_layout_get_box(server->output_layout, s->output, &box);
+		if (s->enabled && !wlr_box_empty(&box) && box.x + box.width > right) {
+			right = box.x + box.width;
+		}
+	}
+	wl_list_for_each(head, &config->heads, link) {
+		struct wlr_output_head_v1_state *s = &head->state;
+		o = desk_output_of(server, s->output);
+		if (!o || !output_is_panel(s->output)) {
+			continue;
+		}
+		if (shut && !o->off) {
+			s->enabled = false;
+		} else if (!shut && o->lid_off) {
+			struct wlr_output_mode *mode = s->output->current_mode;
+			if (!mode) {
+				mode = wlr_output_preferred_mode(s->output);
+			}
+			s->enabled = true;
+			s->mode = mode;
+			if (mode) {
+				s->custom_mode.width = mode->width;
+				s->custom_mode.height = mode->height;
+				s->custom_mode.refresh = mode->refresh;
+			}
+			s->x = right;
+			s->y = 0;
+		}
+	}
+	if (om_try(server, config, true, "lid")) {
+		wl_list_for_each(o, &server->outputs, link) {
+			if (output_is_panel(o->wlr_output)) {
+				o->lid_off = shut && o->off;
+			}
+		}
+		om_publish(server);
+	}
+	wlr_output_configuration_v1_destroy(config);
+}
+
+struct desk_lid {
+	struct desk_server *server;
+	struct wl_listener toggle, destroy;
+};
+
+static void lid_toggle(struct wl_listener *listener, void *data)
+{
+	struct desk_lid *lid = wl_container_of(listener, lid, toggle);
+	const struct wlr_switch_toggle_event *event = data;
+	if (event->switch_type != WLR_SWITCH_TYPE_LID) {
+		return;
+	}
+	bool closed = event->switch_state == WLR_SWITCH_STATE_ON;
+	if (closed == lid->server->lid_closed) {
+		return;
+	}
+	lid->server->lid_closed = closed;
+	wlr_log(WLR_INFO, "lid: %s", closed ? "shut" : "open");
+	lid_apply(lid->server);
+}
+
+static void lid_destroy(struct wl_listener *listener, void *data)
+{
+	struct desk_lid *lid = wl_container_of(listener, lid, destroy);
+	(void)data;
+	wl_list_remove(&lid->toggle.link);
+	wl_list_remove(&lid->destroy.link);
+	free(lid);
+}
+
+static void server_new_switch(struct desk_server *server, struct wlr_input_device *device)
+{
+	struct desk_lid *lid = calloc(1, sizeof *lid);
+	if (!lid) {
+		return;
+	}
+	lid->server = server;
+	lid->toggle.notify = lid_toggle;
+	wl_signal_add(&wlr_switch_from_input_device(device)->events.toggle, &lid->toggle);
+	lid->destroy.notify = lid_destroy;
+	wl_signal_add(&device->events.destroy, &lid->destroy);
 }
 
 /* ---- a day kept: the shows ----
@@ -19281,6 +19463,9 @@ static void server_new_input(struct wl_listener *listener, void *data)
 		/* only so a finger on the glass counts as somebody here */
 		wlr_cursor_attach_input_device(server->cursor, device);
 		input_map_to_output(server, device);
+		break;
+	case WLR_INPUT_DEVICE_SWITCH:
+		server_new_switch(server, device);
 		break;
 	default:
 		break;
@@ -22479,6 +22664,7 @@ int main(int argc, char **argv)
 
 	wl_list_init(&server.keyboards);
 	wl_list_init(&server.pointers);
+	server.lid_closed = lid_read_closed();
 	server.new_input.notify = server_new_input;
 	wl_signal_add(&server.backend->events.new_input, &server.new_input);
 	server.seat = wlr_seat_create(server.wl_display, "seat0");
