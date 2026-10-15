@@ -1,0 +1,710 @@
+#!/usr/bin/python3 -I
+"""desk-clipboard -- what has been copied, kept encrypted, and Super+V to
+copy one of them again.
+
+    desk-clipboard watch             keep what is copied (DEsk starts it)
+    desk-clipboard show              the history on a memo sheet (Super+V)
+    desk-clipboard pick              the history, in this terminal
+    desk-clipboard incognito [on|off|toggle|status]
+                                     stop keeping copies for a while
+                                     (Super+Shift+V toggles it)
+    desk-clipboard clear [--all]     forget all but the pinned (or all)
+    desk-clipboard status            how much is kept, and where
+
+Kept in $XDG_DATA_HOME/desk/clipboard.db (SQLite). Every copy in it is
+encrypted with AES-256-GCM; the key is in the login keyring (secret-tool,
+"DEsk clipboard history"), not on the disk beside it, so the file alone
+reads as nothing. What is not encrypted: when each was copied, and whether
+it is pinned.
+
+Passwords: a copy from a password manager (one named in mask -- DEsk
+says which program copied: $XDG_RUNTIME_DIR/desk-clipboard/source) or
+marked secret (CLIPBOARD_STATE=sensitive) is kept, but shown masked
+(•••••••• password) in the list and the preview; Enter still copies it.
+Not kept at all: copies from a program named in exclude, and anything
+while incognito. Text only, up to 1 MiB a copy.
+
+$XDG_CONFIG_HOME/desk/clipboard.conf:
+    keep = 200                       how many, besides the pinned
+    mask = bitwarden, keepass        password managers: kept, shown masked
+                                     (a part of the app id or X class;
+                                     replaces the list below)
+    exclude = someapp                programs whose copies are never kept
+"""
+
+import base64
+import hashlib
+import hmac
+import os
+import shlex
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+
+AAD = b"desk-clipboard/1"
+MAX_BYTES = 1 << 20
+DEFAULT_KEEP = 200
+DEFAULT_MASK = [
+    "bitwarden", "keepass", "1password", "enpass", "org.gnome.world.secrets",
+    "seahorse", "kwallet", "protonpass", "proton-pass", "proton.pass",
+    "passwordsafe", "gopass", "lastpass", "dashlane", "nordpass",
+    "authenticator", "org.gnome.keysign",
+]
+
+HOME = os.path.expanduser("~")
+DATA = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share")
+CONFIG = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+RUN = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+DB_PATH = os.path.join(DATA, "desk", "clipboard.db")
+RUN_DIR = os.path.join(RUN, "desk-clipboard")
+INCOGNITO = os.path.join(RUN_DIR, "incognito")
+SOURCE = os.path.join(RUN_DIR, "source")
+SELF = shutil.which("desk-clipboard") or os.path.abspath(sys.argv[0])
+
+SECRET_ATTRS = ["application", "desk-clipboard", "kind", "history-key"]
+
+
+def say(msg):
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "Clipboard", "Clipboard", msg],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        print(msg, file=sys.stderr)
+
+
+def say_once(tag, msg):
+    """Said once a session, not at every copy."""
+    os.makedirs(RUN_DIR, mode=0o700, exist_ok=True)
+    flag = os.path.join(RUN_DIR, ".said-" + tag)
+    if not os.path.exists(flag):
+        open(flag, "w").close()
+        say(msg)
+
+
+def conf():
+    keep, mask, exclude = DEFAULT_KEEP, list(DEFAULT_MASK), []
+    try:
+        with open(os.path.join(CONFIG, "desk", "clipboard.conf"), encoding="utf-8") as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                k, v = (x.strip() for x in line.split("=", 1))
+                if k == "keep" and v.isdigit():
+                    keep = max(1, min(int(v), 100000))
+                elif k in ("exclude", "mask"):
+                    words = [w.strip().lower() for w in v.split(",") if w.strip()]
+                    if k == "exclude":
+                        exclude = words
+                    else:
+                        mask = words
+    except OSError:
+        pass
+    return keep, mask, exclude
+
+
+# ---- the key, in the login keyring ----
+
+def keyring_lookup():
+    try:
+        r = subprocess.run(["secret-tool", "lookup"] + SECRET_ATTRS,
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    try:
+        k = base64.b64decode(r.stdout.strip(), validate=True)
+    except ValueError:
+        return None
+    return k if len(k) == 32 else None
+
+
+def keyring_store(k):
+    try:
+        r = subprocess.run(["secret-tool", "store", "--label=DEsk clipboard history"]
+                           + SECRET_ATTRS, input=base64.b64encode(k).decode(),
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+class Store:
+    def __init__(self, create):
+        os.makedirs(os.path.dirname(DB_PATH), mode=0o700, exist_ok=True)
+        fresh = not os.path.exists(DB_PATH)
+        if fresh and not create:
+            raise LookupError("nothing has been copied yet")
+        old = os.umask(0o077)
+        try:
+            self.db = sqlite3.connect(DB_PATH, timeout=10)
+        finally:
+            os.umask(old)
+        os.chmod(DB_PATH, 0o600)
+        self.db.execute("PRAGMA secure_delete = ON")
+        self.db.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v BLOB)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS items ("
+                        " id INTEGER PRIMARY KEY, mac BLOB UNIQUE NOT NULL,"
+                        " at REAL NOT NULL, pinned INTEGER NOT NULL DEFAULT 0,"
+                        " nonce BLOB NOT NULL, data BLOB NOT NULL)")
+        cols = [r[1] for r in self.db.execute("PRAGMA table_info(items)")]
+        if "secret" not in cols:
+            self.db.execute("ALTER TABLE items ADD COLUMN secret INTEGER NOT NULL DEFAULT 0")
+            self.db.commit()
+        self._key()
+
+    def _key(self):
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        row = self.db.execute("SELECT v FROM meta WHERE k = 'check'").fetchone()
+        k = keyring_lookup()
+        if k is None:
+            if row is not None:
+                # a history made with a key the keyring no longer gives:
+                # never a new key over it, which would make it unreadable
+                raise PermissionError("the login keyring did not give the clipboard "
+                                      "history's key (is it unlocked?)")
+            k = os.urandom(32)
+            if not keyring_store(k) or keyring_lookup() != k:
+                raise PermissionError("the key could not be put in the login keyring")
+        root = k
+        self.enc = AESGCM(hmac.new(root, b"desk-clipboard enc", hashlib.sha256).digest())
+        self.mac_key = hmac.new(root, b"desk-clipboard mac", hashlib.sha256).digest()
+        if row is None:
+            nonce = os.urandom(12)
+            self.db.execute("INSERT INTO meta VALUES ('check', ?)",
+                            (nonce + self.enc.encrypt(nonce, b"desk-clipboard", AAD),))
+            self.db.commit()
+        else:
+            v = row[0]
+            try:
+                self.enc.decrypt(v[:12], v[12:], AAD)
+            except Exception:
+                raise PermissionError("the keyring's key does not open this clipboard "
+                                      "history (%s)" % DB_PATH)
+
+    def mac(self, data):
+        return hmac.new(self.mac_key, data, hashlib.sha256).digest()
+
+    def add(self, data, keep, secret):
+        mac = self.mac(data)
+        now = time.time()
+        # once a password, always shown as one, whoever copies it again
+        cur = self.db.execute("UPDATE items SET at = ?, secret = MAX(secret, ?)"
+                              " WHERE mac = ?", (now, int(secret), mac))
+        if cur.rowcount == 0:
+            nonce = os.urandom(12)
+            self.db.execute("INSERT INTO items (mac, at, pinned, nonce, data, secret)"
+                            " VALUES (?, ?, 0, ?, ?, ?)",
+                            (mac, now, nonce, self.enc.encrypt(nonce, data, AAD + mac),
+                             int(secret)))
+        self.db.execute("DELETE FROM items WHERE pinned = 0 AND id NOT IN"
+                        " (SELECT id FROM items WHERE pinned = 0"
+                        "  ORDER BY at DESC LIMIT ?)", (keep,))
+        self.db.commit()
+
+    def rows(self):
+        return self.db.execute("SELECT id, pinned, secret, mac, nonce, data FROM items"
+                               " ORDER BY pinned DESC, at DESC").fetchall()
+
+    def open_row(self, mac, nonce, data):
+        return self.enc.decrypt(nonce, data, AAD + mac)
+
+    def get(self, ident):
+        row = self.db.execute("SELECT mac, nonce, data FROM items WHERE id = ?",
+                              (ident,)).fetchone()
+        return self.open_row(*row) if row else None
+
+
+def open_store(create=False):
+    try:
+        return Store(create)
+    except LookupError as e:
+        print(str(e), file=sys.stderr)
+        return None
+    except PermissionError as e:
+        say_once("key", "Clipboard history is off: " + str(e))
+        print(str(e), file=sys.stderr)
+        return None
+
+
+# ---- keeping a copy ----
+
+def source_words():
+    try:
+        with open(SOURCE, encoding="utf-8", errors="replace") as f:
+            return f.read().lower().split()
+    except OSError:
+        return []
+
+
+def cmd_store():
+    state = os.environ.get("CLIPBOARD_STATE", "data")
+    if state not in ("data", "sensitive"):
+        sys.stdin.buffer.read()
+        return 0
+    data = sys.stdin.buffer.read(MAX_BYTES + 1)
+    if os.path.exists(INCOGNITO) or len(data) > MAX_BYTES or not data.strip():
+        return 0
+    keep, mask, exclude = conf()
+    words = source_words()
+    if any(x in w for w in words for x in exclude):
+        return 0
+    secret = state == "sensitive" or any(x in w for w in words for x in mask)
+    st = open_store(create=True)
+    if st:
+        st.add(data, keep, secret)
+    return 0
+
+
+def cmd_watch():
+    if not shutil.which("wl-paste"):
+        say("wl-clipboard is not installed, so nothing copied is kept")
+        return 1
+    os.makedirs(RUN_DIR, mode=0o700, exist_ok=True)
+    # one watcher a session
+    os.execvp("flock", ["flock", "-n", os.path.join(RUN_DIR, ".watch"),
+                        "wl-paste", "--type", "text", "--watch", SELF, "store"])
+
+
+# ---- looking back ----
+
+def preview(data):
+    t = data[:600].decode("utf-8", errors="replace")
+    t = " ".join(t.split())
+    return t[:200] if t else "(blank)"
+
+
+def cmd_list():
+    st = open_store()
+    if not st:
+        return 0
+    out = []
+    for ident, pinned, secret, mac, nonce, data in st.rows():
+        if secret:
+            text = "•••••••• password"
+        else:
+            try:
+                text = preview(st.open_row(mac, nonce, data))
+            except Exception:
+                text = "(cannot be read)"
+        out.append("%d\t%s%s" % (ident, "★ " if pinned else "", text))
+    sys.stdout.write("\n".join(out) + ("\n" if out else ""))
+    return 0
+
+
+def cmd_get(ident):
+    st = open_store()
+    data = st.get(int(ident)) if st and ident.isdigit() else None
+    if data is not None:
+        sys.stdout.buffer.write(data)
+    return 0
+
+
+def cmd_peek(ident):
+    st = open_store()
+    if not st or not ident.isdigit():
+        return 0
+    row = st.db.execute("SELECT secret FROM items WHERE id = ?", (int(ident),)).fetchone()
+    if row and row[0]:
+        print("•••••••• a password: Enter copies it, it is not shown")
+        return 0
+    data = st.get(int(ident))
+    if data is not None:
+        sys.stdout.buffer.write(data)
+    return 0
+
+
+def cmd_copy(ident):
+    st = open_store()
+    data = st.get(int(ident)) if st and ident.isdigit() else None
+    if data is None:
+        return 1
+    # served on after the window it was chosen in has gone
+    p = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE, start_new_session=True)
+    p.stdin.write(data)
+    p.stdin.close()
+    p.wait()
+    return 0
+
+
+def cmd_delete(ident):
+    st = open_store()
+    if st and ident.isdigit():
+        st.db.execute("DELETE FROM items WHERE id = ?", (int(ident),))
+        st.db.commit()
+    return 0
+
+
+def cmd_pin(ident):
+    st = open_store()
+    if st and ident.isdigit():
+        st.db.execute("UPDATE items SET pinned = 1 - pinned WHERE id = ?", (int(ident),))
+        st.db.commit()
+    return 0
+
+
+def cmd_clear(args):
+    st = open_store()
+    if st:
+        if "--all" in args:
+            st.db.execute("DELETE FROM items")
+        else:
+            st.db.execute("DELETE FROM items WHERE pinned = 0")
+        st.db.commit()
+        st.db.execute("VACUUM")
+    return 0
+
+
+def cmd_incognito(args):
+    what = args[0] if args else "toggle"
+    on = os.path.exists(INCOGNITO)
+    if what == "status":
+        print("on" if on else "off")
+        return 0
+    want = {"on": True, "off": False}.get(what, not on)
+    os.makedirs(RUN_DIR, mode=0o700, exist_ok=True)
+    if want:
+        open(INCOGNITO, "w").close()
+    elif on:
+        os.unlink(INCOGNITO)
+    say("Incognito: nothing copied is kept until you turn it off (Super+Shift+V)"
+        if want else "Copies are kept again")
+    return 0
+
+
+def cmd_status():
+    keep, mask, exclude = conf()
+    print("history   %s" % DB_PATH)
+    print("keep      %d, and the pinned" % keep)
+    print("incognito %s" % ("on" if os.path.exists(INCOGNITO) else "off"))
+    print("masked    %s" % ", ".join(mask))
+    print("exclude   %s" % (", ".join(exclude) or "none"))
+    st = open_store()
+    if st:
+        n, p = st.db.execute("SELECT COUNT(*), COALESCE(SUM(pinned), 0) FROM items").fetchone()
+        print("kept      %d (%d pinned)" % (n, p))
+    return 0
+
+
+def cmd_pick():
+    if not shutil.which("fzf"):
+        print("fzf is not installed (sudo dnf install fzf).")
+        time.sleep(3)
+        return 1
+    if not open_store():
+        time.sleep(2)
+        return 0
+    me = shlex.quote(SELF)
+    incog = "   [incognito: not keeping copies]" if os.path.exists(INCOGNITO) else ""
+    listing = subprocess.run([SELF, "list"], capture_output=True).stdout
+    if not listing.strip():
+        print("Nothing has been copied yet.")
+        time.sleep(1.5)
+        return 0
+    r = subprocess.run(
+        ["fzf", "--delimiter=\t", "--with-nth=2..", "--no-sort", "--layout=reverse",
+         "--prompt=Clipboard > ", "--info=inline",
+         "--header=Enter copy · Ctrl-P pin · Del forget · Ctrl-X forget unpinned · Esc close"
+         + incog,
+         "--preview=%s peek {1}" % me, "--preview-window=down,45%,wrap",
+         "--bind=del:execute-silent(%s delete {1})+reload(%s list)" % (me, me),
+         "--bind=ctrl-p:execute-silent(%s pin {1})+reload(%s list)" % (me, me),
+         "--bind=ctrl-x:execute-silent(%s clear)+reload(%s list)" % (me, me)],
+        input=listing, capture_output=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        return 0
+    return cmd_copy(r.stdout.split(b"\t", 1)[0].decode())
+
+
+def cmd_show_terminal():
+    if not shutil.which("foot"):
+        say("foot is not installed, so the clipboard history cannot be shown")
+        return 1
+    os.execvp("foot", ["foot", "--app-id=desk-clipboard", "--title=Clipboard",
+                       "--window-size-chars=100x26", SELF, "pick"])
+
+
+# ---- the memo pad (Super+V) ----
+#
+# The history as a sheet off DEsk's memo pad: cream paper, blue rules, the
+# red margin, MEMO's red heading, the entries in ballpoint navy and the one
+# chosen marked over with a highlighter. GTK 4; without it, the terminal.
+
+PAD_CSS = b"""
+window.pad, window.pad > * { background-color: #f7f2e2; color: #1d2a63; }
+.pad-head {
+  padding: 16px 22px 10px 72px;
+  border-bottom: 2px solid rgba(209, 82, 66, 0.70);
+}
+.pad-title {
+  color: #b8332a; font-family: "Nimbus Sans", sans-serif; font-weight: bold;
+  font-size: 13pt; letter-spacing: 4px;
+}
+.pad-count { color: #8a7d68; font-family: "Nimbus Sans", sans-serif; font-size: 9pt; }
+.pad-incognito {
+  color: #f7f2e2; background-color: #6b5a44; border-radius: 3px;
+  padding: 1px 7px; font-family: "Nimbus Sans", sans-serif; font-size: 8pt;
+  font-weight: bold; letter-spacing: 1px;
+}
+entry.pad-search, entry.pad-search:focus-within {
+  background: transparent; border: none; box-shadow: none; outline: none;
+  border-bottom: 1px solid rgba(107, 148, 194, 0.65); border-radius: 0;
+  font-family: "Nimbus Mono PS", monospace; font-size: 13pt; color: #1d2a63;
+  caret-color: #b8332a; padding: 4px 2px; min-height: 28px;
+}
+scrolledwindow.pad-sheet, scrolledwindow.pad-sheet > viewport {
+  background-color: transparent;
+}
+list.pad-list {
+  background-color: transparent;
+  background-image: linear-gradient(to right,
+      transparent 56px, rgba(209, 82, 66, 0.55) 56px,
+      rgba(209, 82, 66, 0.55) 58px, transparent 58px);
+}
+list.pad-list > row {
+  background-color: transparent; color: #1d2a63;
+  border-bottom: 1px solid rgba(107, 148, 194, 0.45);
+  padding: 9px 22px 9px 72px; min-height: 26px;
+}
+list.pad-list > row:hover { background-color: rgba(107, 148, 194, 0.08); }
+list.pad-list > row:selected {
+  background-color: rgba(255, 221, 87, 0.55); color: #1d2a63;
+}
+.pad-text { font-family: "Nimbus Mono PS", monospace; font-size: 11pt; }
+.pad-secret { color: #6f6352; font-style: italic; }
+.pad-pin { color: #b8332a; font-size: 12pt; }
+.pad-time { color: #8a7d68; font-family: "Nimbus Sans", sans-serif; font-size: 9pt; }
+.pad-empty {
+  color: #8a7d68; font-family: "Nimbus Mono PS", monospace; font-size: 12pt;
+  padding: 40px 72px;
+}
+.pad-foot {
+  color: #8a7d68; font-family: "Nimbus Sans", sans-serif; font-size: 9pt;
+  padding: 7px 22px 9px 72px; border-top: 1px solid rgba(138, 125, 104, 0.35);
+}
+"""
+
+
+def when(at):
+    d = time.time() - at
+    if d < 60:
+        return "just now"
+    if d < 3600:
+        return "%d min ago" % (d // 60)
+    if d < 86400:
+        return "%d h ago" % (d // 3600)
+    if d < 2 * 86400:
+        return "yesterday"
+    return time.strftime("%d %b", time.localtime(at))
+
+
+def cmd_show():
+    try:
+        import gi
+        gi.require_version("Gtk", "4.0")
+        from gi.repository import Gdk, GLib, Gtk, Pango
+    except (ImportError, ValueError):
+        return cmd_show_terminal()
+    st = open_store()
+    if not st:
+        say("Nothing has been copied yet." if not os.path.exists(DB_PATH)
+            else "The clipboard history cannot be opened (is the keyring unlocked?)")
+        return 0
+
+    class Pad:
+        def __init__(self, app):
+            self.app = app
+            self.items = []
+            self.chosen = None
+            win = self.win = Gtk.ApplicationWindow(application=app, title="Clipboard")
+            win.add_css_class("pad")
+            win.set_default_size(680, 600)
+            css = Gtk.CssProvider()
+            css.load_from_data(PAD_CSS)
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            head = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            head.add_css_class("pad-head")
+            line = Gtk.Box(spacing=10)
+            title = Gtk.Label(label="CLIPBOARD", xalign=0)
+            title.add_css_class("pad-title")
+            line.append(title)
+            if os.path.exists(INCOGNITO):
+                tag = Gtk.Label(label="INCOGNITO")
+                tag.add_css_class("pad-incognito")
+                tag.set_valign(Gtk.Align.CENTER)
+                line.append(tag)
+            self.count = Gtk.Label(xalign=1, hexpand=True)
+            self.count.add_css_class("pad-count")
+            line.append(self.count)
+            head.append(line)
+            self.search = Gtk.Entry(placeholder_text="search…")
+            self.search.add_css_class("pad-search")
+            self.search.connect("changed", lambda *_: self.fill())
+            self.search.connect("activate", lambda *_: self.copy())
+            head.append(self.search)
+            box.append(head)
+
+            self.list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.BROWSE)
+            self.list.add_css_class("pad-list")
+            self.list.set_activate_on_single_click(False)
+            self.list.connect("row-activated", lambda *_: self.copy())
+            empty = Gtk.Label(label="Nothing copied yet.", xalign=0)
+            empty.add_css_class("pad-empty")
+            self.list.set_placeholder(empty)
+            sheet = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+            sheet.add_css_class("pad-sheet")
+            sheet.set_child(self.list)
+            box.append(sheet)
+
+            foot = Gtk.Label(xalign=0, label="Enter copy · Ctrl+P pin · Del forget · "
+                             "Ctrl+X forget all but pinned · Esc close")
+            foot.add_css_class("pad-foot")
+            box.append(foot)
+            win.set_child(box)
+
+            keys = Gtk.EventControllerKey()
+            keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            keys.connect("key-pressed", self.key)
+            win.add_controller(keys)
+
+            self.load()
+            win.present()
+            self.search.grab_focus()
+
+        def load(self):
+            self.items = []
+            rows = st.db.execute("SELECT id, pinned, secret, at, mac, nonce, data FROM items"
+                                 " ORDER BY pinned DESC, at DESC").fetchall()
+            for ident, pinned, secret, at, mac, nonce, data in rows:
+                if secret:
+                    text = None
+                else:
+                    try:
+                        text = st.open_row(mac, nonce, data).decode("utf-8", "replace")
+                    except Exception:
+                        text = "(cannot be read)"
+                self.items.append((ident, bool(pinned), bool(secret), at, text))
+            n = len(self.items)
+            self.count.set_label("%d kept" % n if n != 1 else "1 kept")
+            self.fill()
+
+        def fill(self, keep_at=None):
+            want = self.search.get_text().lower().split()
+            child = self.list.get_first_child()
+            while child:
+                nxt = child.get_next_sibling()
+                self.list.remove(child)
+                child = nxt
+            for ident, pinned, secret, at, text in self.items:
+                hay = ("password" if secret else text.lower())
+                if want and not all(w in hay for w in want):
+                    continue
+                row = Gtk.ListBoxRow()
+                row.ident = ident
+                line = Gtk.Box(spacing=12)
+                pin = Gtk.Label(label="★" if pinned else " ")
+                pin.add_css_class("pad-pin")
+                pin.set_valign(Gtk.Align.START)
+                line.append(pin)
+                shown = "•••••••• password" if secret else " ".join(text.split()[:200])[:600]
+                lab = Gtk.Label(label=shown or "(blank)", xalign=0, hexpand=True,
+                                wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, lines=2,
+                                ellipsize=Pango.EllipsizeMode.END)
+                lab.add_css_class("pad-text")
+                if secret:
+                    lab.add_css_class("pad-secret")
+                elif len(text) > len(shown):
+                    lab.set_tooltip_text(text[:2000])
+                line.append(lab)
+                t = Gtk.Label(label=when(at))
+                t.add_css_class("pad-time")
+                t.set_valign(Gtk.Align.START)
+                line.append(t)
+                row.set_child(line)
+                self.list.append(row)
+            first = self.list.get_row_at_index(keep_at or 0) or self.list.get_row_at_index(0)
+            if first:
+                self.list.select_row(first)
+
+        def selected(self):
+            row = self.list.get_selected_row()
+            return row.ident if row else None
+
+        def move(self, by):
+            row = self.list.get_selected_row()
+            i = (row.get_index() if row else -1) + by
+            n = 0
+            while self.list.get_row_at_index(n):
+                n += 1
+            if n:
+                row = self.list.get_row_at_index(max(0, min(n - 1, i)))
+                self.list.select_row(row)
+                row.grab_focus()
+                self.search.grab_focus_without_selecting()
+
+        def copy(self):
+            ident = self.selected()
+            if ident is not None:
+                self.chosen = ident
+                self.win.close()
+
+        def key(self, ctl, keyval, code, mods):
+            ctrl = bool(mods & Gdk.ModifierType.CONTROL_MASK)
+            row = self.list.get_selected_row()
+            at = row.get_index() if row else 0
+            if keyval == Gdk.KEY_Escape:
+                self.win.close()
+            elif keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+                self.copy()
+            elif keyval in (Gdk.KEY_Down, Gdk.KEY_Up, Gdk.KEY_Page_Down, Gdk.KEY_Page_Up):
+                self.move({Gdk.KEY_Down: 1, Gdk.KEY_Up: -1,
+                           Gdk.KEY_Page_Down: 8, Gdk.KEY_Page_Up: -8}[keyval])
+            elif keyval == Gdk.KEY_Delete and self.selected() is not None:
+                cmd_delete(str(self.selected()))
+                self.load()
+                self.fill(keep_at=at)
+            elif ctrl and keyval in (Gdk.KEY_p, Gdk.KEY_P) and self.selected() is not None:
+                cmd_pin(str(self.selected()))
+                self.load()
+            elif ctrl and keyval in (Gdk.KEY_x, Gdk.KEY_X):
+                cmd_clear([])
+                self.load()
+            else:
+                return False
+            return True
+
+    app = Gtk.Application(application_id="desk.Clipboard")
+    pads = []
+    app.connect("activate", lambda a: pads.append(Pad(a)))
+    app.run([])
+    if pads and pads[0].chosen is not None:
+        return cmd_copy(str(pads[0].chosen))
+    return 0
+
+
+def main(argv):
+    cmd, args = (argv[1], argv[2:]) if len(argv) > 1 else ("", [])
+    one = args[0] if args else ""
+    table = {
+        "watch": cmd_watch, "store": cmd_store, "list": cmd_list,
+        "pick": cmd_pick, "show": cmd_show, "show-terminal": cmd_show_terminal,
+        "status": cmd_status,
+        "get": lambda: cmd_get(one), "peek": lambda: cmd_peek(one),
+        "copy": lambda: cmd_copy(one),
+        "delete": lambda: cmd_delete(one), "pin": lambda: cmd_pin(one),
+        "clear": lambda: cmd_clear(args), "incognito": lambda: cmd_incognito(args),
+    }
+    if cmd not in table:
+        print(__doc__.strip())
+        return 2
+    return table[cmd]() or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

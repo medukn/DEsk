@@ -323,11 +323,13 @@ install_data(
   'session/autostart/desk-network.desktop',
   'session/autostart/desk-media.desktop',
   'session/autostart/desk-power.desktop',
+  'session/autostart/desk-clipboard.desktop',
   install_dir: get_option('datadir') / 'desk' / 'autostart',
 )
 # the screen lock's PAM service (it includes "login"); PAM reads only /etc
 install_data('session/pam/desk', install_dir: '/etc/pam.d')
 install_data('scripts/desk-session-helper', 'scripts/desk-screenshot', 'scripts/desk-ctl',
+  'scripts/desk-clipboard',
   install_dir: get_option('bindir'),
   install_mode: 'rwxr-xr-x',
 )
