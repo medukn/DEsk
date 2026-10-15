@@ -49,7 +49,7 @@ d71a97f44854ceed9b3c1c68506b083ce22099977388599e1eabaed37002deed  ./meson_option
 65b0f82a6cf129bf1a1c31a2428795abd33886c15ddd5f3ad97e5922d7bdc3a7  ./protocols/wlr-output-management-unstable-v1.xml
 7ebd98f3449d246a57829e4b4dd9fbc3ef98e3dd42fa94ea102f14f490eb20de  ./protocols/wlr-output-power-management-unstable-v1.xml
 84d400c18f7f7804c3a979de2c72b1bdee26da5067add45d2aba79bda16f1be0  ./scripts/check-words.py
-ca13df742264397c2e42170c2d11524bd220a1bb0fded017619b2f59cfbf3596  ./scripts/desk-clipboard
+48c88b596c4c5041ee2913655e56b4ff777d57e8b346ba27d0f0ad7f073c3db9  ./scripts/desk-clipboard
 d45b7f3fb8115abeee25582d8d5ae20c0c48fcc826ca10fc533eec8583a6d5e4  ./scripts/desk-ctl
 075de08ad330e4b5ebc6b409a165efe28c83d2d95e9fc5da50793e0e69d5965a  ./scripts/desk-screenshot
 9da49b18996d5dbf5792f68fd2e1cb5a1f1ee1e26875eff9d154efb68368d837  ./scripts/desk-session-helper
