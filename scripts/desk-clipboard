@@ -7,7 +7,7 @@ copy one of them again.
     desk-clipboard pick              the history, in this terminal
     desk-clipboard incognito [on|off|toggle|status]
                                      stop keeping copies for a while
-                                     (Super+Shift+V toggles it)
+                                     (Ctrl+Super+Shift+V toggles it)
     desk-clipboard clear [--all]     forget all but the pinned (or all)
     desk-clipboard status            how much is kept, and where
 
@@ -370,7 +370,7 @@ def cmd_incognito(args):
         open(INCOGNITO, "w").close()
     elif on:
         os.unlink(INCOGNITO)
-    say("Incognito: nothing copied is kept until you turn it off (Super+Shift+V)"
+    say("Incognito: nothing copied is kept until you turn it off (Ctrl+Super+Shift+V)"
         if want else "Copies are kept again")
     return 0
 

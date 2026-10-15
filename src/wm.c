@@ -16058,9 +16058,12 @@ static bool handle_keybinding(struct desk_server *server, xkb_keysym_t sym, uint
 		case XKB_KEY_v:
 		case XKB_KEY_V:
 			/* what has been copied, to copy one again (desk-clipboard);
-			 * with Shift, keeping what is copied paused or resumed */
-			spawn((mods & WLR_MODIFIER_SHIFT) ? "desk-clipboard incognito toggle"
-				: "desk-clipboard show");
+			 * with Ctrl and Shift both, keeping what is copied paused or
+			 * resumed -- hard to press by mistake, as Pano and Copyous
+			 * have it (Shift alone slipped onto Super+V turned it off
+			 * unnoticed); Super+Shift+V is only Super+V */
+			spawn((mods & WLR_MODIFIER_SHIFT) && (mods & WLR_MODIFIER_CTRL)
+				? "desk-clipboard incognito toggle" : "desk-clipboard show");
 			return true;
 		case XKB_KEY_n:
 		case XKB_KEY_N:
