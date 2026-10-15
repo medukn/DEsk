@@ -54,6 +54,12 @@ sudo sh scripts/install_ubuntu.sh
 sudo sh scripts/install_arch.sh
 ```
 
+**Fedora 41 and later** (Workstation and the spins)
+
+```sh
+sudo sh scripts/install_fedora.sh
+```
+
 Then log out and choose **DEsk** on the login screen.
 
 - It shows what it will install and asks first. `--yes` takes the suggested
@@ -400,7 +406,7 @@ use the installer for your system ([Install](#install)). All three take the
 same options:
 
 ```sh
-sudo sh scripts/install_debian.sh              # or install_ubuntu.sh, install_arch.sh
+sudo sh scripts/install_debian.sh              # or install_ubuntu.sh, install_arch.sh, install_fedora.sh
 sudo sh scripts/install_debian.sh --no-apps    # DEsk, what it needs and what Shell Settings opens
 sudo sh scripts/install_debian.sh --bare       # DEsk and what it needs, no programs (containers)
 sudo sh scripts/install_debian.sh --prefix /opt/desk

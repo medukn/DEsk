@@ -6,8 +6,9 @@
 #   Debian 13 (and what is built on it)        scripts/install_debian.sh
 #   Ubuntu 24.04 / 26.04 (Mint, Pop!_OS...)    scripts/install_ubuntu.sh
 #   Arch Linux (EndeavourOS, Manjaro...)       scripts/install_arch.sh
+#   Fedora 41 and later                        scripts/install_fedora.sh
 #
-# The three take the same options, and everything you give this is handed
+# The four take the same options, and everything you give this is handed
 # on as it is:
 #
 #   --yes          do not ask; take the answers it would suggest
@@ -47,7 +48,8 @@ fi
 
 if [ ! -r /etc/os-release ]; then
 	echo "install_session.sh: there is no /etc/os-release, so which Linux this is is not known." >&2
-	echo "Run scripts/install_debian.sh, install_ubuntu.sh or install_arch.sh yourself." >&2
+	echo "Run scripts/install_debian.sh, install_ubuntu.sh, install_arch.sh or" >&2
+	echo "install_fedora.sh yourself." >&2
 	exit 1
 fi
 # shellcheck disable=SC1091
@@ -60,6 +62,7 @@ for id in ${ID:-} ${ID_LIKE:-}; do
 	ubuntu) which=ubuntu ;;
 	debian) which=debian ;;
 	arch|archlinux) which=arch ;;
+	fedora) which=fedora ;;
 	*) continue ;;
 	esac
 	break
@@ -68,7 +71,7 @@ done
 name="${PRETTY_NAME:-${ID:-this Linux}}"
 if [ -z "$which" ]; then
 	echo "install_session.sh: $name is not one DEsk has an installer for." >&2
-	echo "There is one for Debian 13, Ubuntu 24.04 and 26.04, and Arch Linux. Here, install" >&2
+	echo "There is one for Debian 13, Ubuntu 24.04 and 26.04, Arch Linux and Fedora. Here, install" >&2
 	echo "what the README lists, then scripts/install.sh builds and installs DEsk and" >&2
 	echo "scripts/install-desktop.sh brings the programs that go with it." >&2
 	exit 1
