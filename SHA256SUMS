@@ -49,7 +49,7 @@ d71a97f44854ceed9b3c1c68506b083ce22099977388599e1eabaed37002deed  ./meson_option
 65b0f82a6cf129bf1a1c31a2428795abd33886c15ddd5f3ad97e5922d7bdc3a7  ./protocols/wlr-output-management-unstable-v1.xml
 7ebd98f3449d246a57829e4b4dd9fbc3ef98e3dd42fa94ea102f14f490eb20de  ./protocols/wlr-output-power-management-unstable-v1.xml
 84d400c18f7f7804c3a979de2c72b1bdee26da5067add45d2aba79bda16f1be0  ./scripts/check-words.py
-48c88b596c4c5041ee2913655e56b4ff777d57e8b346ba27d0f0ad7f073c3db9  ./scripts/desk-clipboard
+aecb2d9da00c55ad09d83e33b4173129ef942b12077923bbf59d6a125cb55eec  ./scripts/desk-clipboard
 d45b7f3fb8115abeee25582d8d5ae20c0c48fcc826ca10fc533eec8583a6d5e4  ./scripts/desk-ctl
 075de08ad330e4b5ebc6b409a165efe28c83d2d95e9fc5da50793e0e69d5965a  ./scripts/desk-screenshot
 9da49b18996d5dbf5792f68fd2e1cb5a1f1ee1e26875eff9d154efb68368d837  ./scripts/desk-session-helper
@@ -109,7 +109,7 @@ f15abec6131a859b0b917448a55c50f930feb5e9624e8f0e7a97718e53234ec0  ./src/preview.
 c5062fe9f23c69c728ed2505188f2bd5791a9072d1d013a073346dd79110646e  ./src/sound.c
 2c6a618dae877ea979543d050d2073e40513237d6fcf93fd8cbd3450bbf3fbaa  ./src/tray.c
 de0f5d47c568c8d92a27351f3fd585430e799ef86c031a1f21a63e478c57d9a3  ./src/user.c
-9219b4e6023524638e77322cc8653c13829a8a55450a577161a4515f719e0bf7  ./src/wm.c
+d32ecccb18602203636cb65ed731bdec6ca6e448ddfeef61fa1aff81f5c40173  ./src/wm.c
 95084c4fdadd53f3e2a2df6b92d261bbb0be395b98844c021320a7a54dbf7fce  ./themes/contact-sheet.py
 ccd7f9403ebc18dc92d8e84cbb112ed43b9ed5af04368a40f0429320d0032b0d  ./themes/gtk/DEsk/gtk-3.0/gtk.css
 9b525da1c9c2ea459b8ec1ab5ae67f324ef6ecf64fded2d40ef653d67387596e  ./themes/gtk/DEsk/index.theme
