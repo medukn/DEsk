@@ -99,6 +99,62 @@ static struct desk_cal_look cal_look(int view, int to, double st, int turn, doub
  * the pointer on a tab, bundles going over each way, a page turning, the
  * edges lifted -- without the room behind it, so nothing waits on the
  * tracer. */
+/* The corner of a sheet turned up, as at a few screen sizes, with each of
+ * its instructions under the pointer in turn: for looking at what is
+ * printed on the back of it. */
+static int write_curl(const char *path)
+{
+	static const int widths[] = { 1920, 2560, 3840 };
+	const int hots[] = { -1, DESK_CURL_FOLD, DESK_CURL_DISCARD, DESK_CURL_LAYOUT,
+		DESK_CURL_LAYOUT + 1, DESK_CURL_LAYOUT + 2, DESK_CURL_LAYOUT + 3 };
+	int nh = (int)(sizeof hots / sizeof hots[0]), nw = (int)(sizeof widths / sizeof widths[0]);
+	double rest, open;
+	desk_curl_sizes(widths[nw - 1], 0, &rest, &open);
+	int cell = (int)(open * 1.12 + 18.0) + 40;
+	cairo_surface_t *surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, cell * nh,
+		cell * nw);
+	cairo_t *cr = cairo_create(surf);
+	cairo_set_source_rgb(cr, 0.30, 0.21, 0.14);
+	cairo_paint(cr);
+	for (int r = 0; r < nw; r++) {
+		desk_curl_sizes(widths[r], 0, &rest, &open);
+		double box = open * 1.12 + 18.0;
+		for (int c = 0; c < nh; c++) {
+			cairo_save(cr);
+			cairo_translate(cr, c * cell + 20, r * cell + 20);
+			/* the sheet under the corner */
+			cairo_rectangle(cr, 0, 0, box, box);
+			cairo_set_source_rgb(cr, 0.96, 0.94, 0.89);
+			cairo_fill(cr);
+			desk_draw_curl(cr, box, open, open, 0.6, hots[c], false, "Preview");
+			/* and where the pointer would have to be for it, checked */
+			if (hots[c] >= 0) {
+				int found = -2;
+				for (double yy = 0; yy < box && found != hots[c]; yy += 1.0) {
+					for (double xx = 0; xx < box && found != hots[c]; xx += 1.0) {
+						if (desk_curl_hit(box, open, open, xx, yy) == hots[c]) {
+							found = hots[c];
+							cairo_arc(cr, xx, yy, 2.5, 0, 6.2831853);
+							cairo_set_source_rgb(cr, 0.1, 0.5, 0.9);
+							cairo_fill(cr);
+						}
+					}
+				}
+				if (found != hots[c]) {
+					fprintf(stderr, "curl: item %d cannot be pointed at (%d px screen)\n",
+						hots[c], widths[r]);
+				}
+			}
+			cairo_restore(cr);
+		}
+	}
+	cairo_destroy(cr);
+	cairo_surface_write_to_png(surf, path);
+	cairo_surface_destroy(surf);
+	printf("wrote %s\n", path);
+	return 0;
+}
+
 static int write_calendar(const char *path, int w, int h)
 {
 	struct desk_cal_look looks[] = {
@@ -750,7 +806,7 @@ static int write_lock(const char *path, int w, int h)
 
 #define PREVIEW_USAGE "usage: desk-preview [-o file.png] [-s 1600x1000] [--no-window] " \
 	"[--closed] [--apps] [--shelf] [--console] [--post] [--sounds DIR] [--calendar] " \
-	"[--memo] [--lock] [--boot[=u,u,...]] [--agenda] [--book] [--book-anim[=u,u,...]] " \
+	"[--memo] [--curl] [--lock] [--boot[=u,u,...]] [--agenda] [--book] [--book-anim[=u,u,...]] " \
 	"[--lang en|ja|zh|ko|es|fr|de] [--binder-anim=N[:u,u,...]]\n"
 
 int main(int argc, char **argv)
@@ -762,7 +818,7 @@ int main(int argc, char **argv)
 	bool shelf = false;
 	bool console = false;
 	bool post = false;
-	bool calendar = false, memo = false;
+	bool calendar = false, memo = false, curl = false;
 	const char *boot = NULL;
 	bool lock = false;
 	bool agenda = false;
@@ -792,6 +848,8 @@ int main(int argc, char **argv)
 			return write_sounds(argv[i + 1]);
 		} else if (strcmp(argv[i], "--calendar") == 0) {
 			calendar = true;
+		} else if (strcmp(argv[i], "--curl") == 0) {
+			curl = true;
 		} else if (strcmp(argv[i], "--memo") == 0) {
 			memo = true;
 		} else if (strcmp(argv[i], "--lock") == 0) {
@@ -845,6 +903,9 @@ int main(int argc, char **argv)
 			fprintf(stderr, PREVIEW_USAGE);
 			return 1;
 		}
+	}
+	if (curl) {
+		return write_curl(path);
 	}
 	if (calendar) {
 		return write_calendar(path, w, h);

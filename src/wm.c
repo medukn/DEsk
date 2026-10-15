@@ -1227,6 +1227,14 @@ struct desk_server {
 	/* the screens set out again as displays.conf has them, once the ones
 	 * that are coming have all come (see "the screens as they were left") */
 	struct wl_event_source *disp_idle;
+	/* a sheet dragged against the side or the top of a screen: where it
+	 * would be laid (snap_*), the pencil outline showing it, and where it
+	 * was picked up from, for going back to */
+	int snap_where;
+	struct wlr_box snap_box;
+	struct wlr_scene_tree *snap_tree;
+	struct wlr_scene_rect *snap_fill, *snap_edge[4];
+	int drag_x0, drag_y0;
 	/* the screens set out some other way: the bare desk on the ones beside
 	 * the desk's, and the windows on a screen that has gone put on one
 	 * that is there -- once, after all of a change (screens_idle_cb) */
@@ -1711,6 +1719,8 @@ static void server_schedule_frames(struct desk_server *server);
 static void settings_open(void);
 /* more than one screen (see there) */
 static struct wlr_output *first_output(struct desk_server *server);
+static void snap_hide(struct desk_server *server);
+static void view_toggle_max(struct desk_toplevel *view);
 static struct wlr_output *screen_at(struct desk_server *server, double x, double y);
 static bool screen_is_side(struct desk_server *server, const struct wlr_output *out);
 static struct wlr_box screen_area(struct desk_server *server, struct wlr_output *out);
@@ -11773,6 +11783,7 @@ static struct desk_toplevel *view_of_surface(struct desk_server *server,
 
 static void reset_cursor_mode(struct desk_server *server)
 {
+	snap_hide(server);
 	server->cursor_mode = DESK_CUR_PASSTHROUGH;
 	server->grabbed = NULL;
 }
@@ -12614,6 +12625,171 @@ static void tile_all_back(struct desk_server *server)
 	}
 }
 
+/* ---- a sheet dragged to the edge of its screen ----
+ *
+ * Carried against the left or right side of a screen, it would be laid
+ * over that half of it, against the top over all of it (opened out): a
+ * pencil outline under the sheet shows where, and letting go there lays
+ * it so. A side another screen goes on from is not an edge -- the sheet
+ * is carried over to that screen. Picked up again, a sheet laid that way
+ * comes back to the size it had. */
+
+#define SNAP_EDGE 6
+
+static void snap_hide(struct desk_server *server)
+{
+	server->snap_where = 0;
+	if (server->snap_tree) {
+		wlr_scene_node_set_enabled(&server->snap_tree->node, false);
+	}
+}
+
+static void snap_show(struct desk_server *server, struct desk_toplevel *view, struct wlr_box b)
+{
+	struct wlr_scene_tree *parent = view->scene_tree->node.parent;
+	if (!parent) {
+		return;
+	}
+	if (!server->snap_tree) {
+		/* a wash of paper colour, so that it shows over dark windows and
+		 * the desk alike, and a soft pencil line round it */
+		static const float fill[4] = { 0.97f * 0.30f, 0.94f * 0.30f, 0.86f * 0.30f, 0.30f };
+		static const float edge[4] = { 0.22f * 0.85f, 0.19f * 0.85f, 0.15f * 0.85f, 0.85f };
+		server->snap_tree = wlr_scene_tree_create(parent);
+		if (!server->snap_tree) {
+			return;
+		}
+		server->snap_fill = wlr_scene_rect_create(server->snap_tree, 0, 0, fill);
+		for (int i = 0; i < 4; i++) {
+			server->snap_edge[i] = wlr_scene_rect_create(server->snap_tree, 0, 0, edge);
+		}
+		if (!server->snap_fill || !server->snap_edge[3]) {
+			wlr_scene_node_destroy(&server->snap_tree->node);
+			server->snap_tree = NULL;
+			return;
+		}
+	}
+	if (server->snap_tree->node.parent != parent) {
+		wlr_scene_node_reparent(&server->snap_tree->node, parent);
+	}
+	/* under the sheet being carried, over everything else */
+	wlr_scene_node_place_below(&server->snap_tree->node, &view->scene_tree->node);
+	wlr_scene_node_set_position(&server->snap_tree->node, b.x, b.y);
+	wlr_scene_rect_set_size(server->snap_fill, b.width, b.height);
+	/* a pencil line round it, a little in from the edge */
+	const int e = 3, in = 4;
+	int ex[4] = { in, in, in, b.width - in - e };
+	int ey[4] = { in, b.height - in - e, in, in };
+	int ew[4] = { b.width - 2 * in, b.width - 2 * in, e, e };
+	int eh[4] = { e, e, b.height - 2 * in, b.height - 2 * in };
+	for (int i = 0; i < 4; i++) {
+		wlr_scene_node_set_position(&server->snap_edge[i]->node, ex[i], ey[i]);
+		wlr_scene_rect_set_size(server->snap_edge[i], ew[i] > 0 ? ew[i] : 0,
+			eh[i] > 0 ? eh[i] : 0);
+	}
+	wlr_scene_node_set_enabled(&server->snap_tree->node, true);
+}
+
+/* where the pointer has carried the sheet to: -1 left, 1 right, 2 top */
+static int snap_target(struct desk_server *server, struct desk_toplevel *view,
+	struct wlr_box *box)
+{
+	double cx = server->cursor->x, cy = server->cursor->y;
+	struct wlr_output *out = screen_at(server, cx, cy);
+	struct wlr_box ob = { 0 };
+	if (!out || view->fullscreen) {
+		return 0;
+	}
+	wlr_output_layout_get_box(server->output_layout, out, &ob);
+	struct wlr_box a = max_area(server, out);
+	struct wlr_output_layout *lay = server->output_layout;
+	if (cx <= ob.x + SNAP_EDGE && !wlr_output_layout_output_at(lay, ob.x - 2.0, cy)) {
+		*box = tile_part(a, 0.0, 0.0, 0.5, 1.0);
+		return -1;
+	}
+	if (cx >= ob.x + ob.width - 1 - SNAP_EDGE
+		&& !wlr_output_layout_output_at(lay, ob.x + ob.width + 1.0, cy)) {
+		*box = tile_part(a, 0.5, 0.0, 1.0, 1.0);
+		return 1;
+	}
+	if (cy <= ob.y + SNAP_EDGE && !wlr_output_layout_output_at(lay, cx, ob.y - 2.0)) {
+		*box = a;
+		return 2;
+	}
+	return 0;
+}
+
+/* while carrying: the outline where it would go, if anywhere */
+static void snap_update(struct desk_server *server)
+{
+	struct desk_toplevel *view = server->grabbed;
+	struct wlr_box b;
+	int where = view && view->scene_tree ? snap_target(server, view, &b) : 0;
+	if (where == 0) {
+		snap_hide(server);
+		return;
+	}
+	if (where != server->snap_where || memcmp(&b, &server->snap_box, sizeof b) != 0) {
+		server->snap_where = where;
+		server->snap_box = b;
+		snap_show(server, view, b);
+	}
+}
+
+/* let go: laid where the outline was */
+static void snap_release(struct desk_server *server)
+{
+	struct desk_toplevel *view = server->grabbed;
+	int where = server->snap_where;
+	struct wlr_box b = server->snap_box;
+	snap_hide(server);
+	if (!view || !view->scene_tree || where == 0) {
+		return;
+	}
+	if (where == 2) {
+		if (!view->maximized) {
+			/* opened out from where it was picked up */
+			wlr_scene_node_set_position(&view->scene_tree->node, server->drag_x0,
+				server->drag_y0);
+			view->tiled = false;
+			view_toggle_max(view);
+		}
+		return;
+	}
+	bool was = view->tiled;
+	view_tile(view, b);
+	if (!was) {
+		view->tile_x = server->drag_x0;
+		view->tile_y = server->drag_y0;
+	}
+	view->tile_side = where;
+	view->tile_step = 0;
+}
+
+/* picked up again: a sheet laid by side or scheme has its own size back,
+ * under the pointer where it was held, in proportion */
+static void snap_pick_up(struct desk_server *server, struct desk_toplevel *view)
+{
+	server->drag_x0 = view->scene_tree->node.x;
+	server->drag_y0 = view->scene_tree->node.y;
+	if (!view->tiled) {
+		return;
+	}
+	int l, t, r, b;
+	view_insets(view, &l, &t, &r, &b);
+	double at = view->outer_w > 0 ? server->grab_x / view->outer_w : 0.5;
+	server->drag_x0 = view->tile_x;
+	server->drag_y0 = view->tile_y;
+	view->tiled = false;
+	view->tile_step = 0;
+	int w = view->tile_inner_w + l + r;
+	view_set_size(view, view->tile_inner_w, view->tile_inner_h);
+	server->grab_x = at * w;
+	wlr_scene_node_set_position(&view->scene_tree->node,
+		(int)(server->cursor->x - server->grab_x), view->scene_tree->node.y);
+	view_sync_shadow(view);
+}
+
 /* The tray is only known for certain once the room is traced, and moves
  * when the screen changes shape. Then: any window that has ended up on it
  * comes down off it, a maximised one fits what there is now, and X is told
@@ -12987,6 +13163,22 @@ static void curls_tick(struct desk_server *server)
 					view->curl_near = false;
 					view->curl_hot = -1;
 					view_toggle_max(view);
+					to = rest;
+				}
+				break;
+			case DESK_CURL_LAYOUT:
+			case DESK_CURL_LAYOUT + 1:
+			case DESK_CURL_LAYOUT + 2:
+			case DESK_CURL_LAYOUT + 3:
+				/* laid flat, and the sheets laid out, this one first */
+				to = rest * 0.15;
+				if (e > 0.16) {
+					int scheme = view->curl_act - DESK_CURL_LAYOUT + 2;
+					view->curl_act = -1;
+					view->curl_near = false;
+					view->curl_hot = -1;
+					focus_toplevel(view);
+					tile_scheme(server, scheme);
 					to = rest;
 				}
 				break;
@@ -16021,6 +16213,7 @@ static void begin_interactive(struct desk_toplevel *toplevel, enum desk_cursor_m
 	if (mode == DESK_CUR_MOVE) {
 		server->grab_x = server->cursor->x - toplevel->scene_tree->node.x;
 		server->grab_y = server->cursor->y - toplevel->scene_tree->node.y;
+		snap_pick_up(server, toplevel);
 	} else {
 		struct wlr_box geo;
 		int l, t, r, b;
@@ -19578,6 +19771,7 @@ static void process_cursor_move(struct desk_server *server)
 			(int)(server->cursor->y - server->grab_y)));
 	view_sync_shadow(toplevel);
 	view_send_position(toplevel);
+	snap_update(server);
 }
 
 static void process_cursor_resize(struct desk_server *server)
@@ -19935,6 +20129,9 @@ static void server_cursor_button(struct wl_listener *listener, void *data)
 			/* let go of the edge: the turn of the paper settles */
 			server->grabbed->sz_released = real_sec();
 			server_schedule_frames(server);
+		}
+		if (server->cursor_mode == DESK_CUR_MOVE && server->snap_where != 0) {
+			snap_release(server);
 		}
 		reset_cursor_mode(server);
 		wlr_seat_pointer_notify_button(server->seat, event->time_msec, event->button, event->state);

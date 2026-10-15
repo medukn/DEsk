@@ -809,6 +809,10 @@ bool desk_drawer_handle_hit(int screen_w, int screen_h, double px, double py, do
  * instruction, if any, is at a point in the box it is drawn in (top right
  * on the sheet's corner, its size * 1.12 + 18 square: wm.c view_curl_paint). */
 enum { DESK_CURL_FOLD, DESK_CURL_UNFOLD, DESK_CURL_DISCARD, DESK_CURL_ITEMS };
+/* and under them, nearest the tip, the ways of laying the sheets out
+ * (wm.c tile_scheme 2 to 5): halves, two thirds and a third, quarters,
+ * thirds -- desk_curl_hit says DESK_CURL_LAYOUT + which */
+enum { DESK_CURL_LAYOUT = 16, DESK_CURL_LAYOUTS = 4 };
 void desk_curl_sizes(int screen_w, int screen_h, double *rest, double *open);
 /* The traced room in screen coordinates, as the compositor lays it for a
  * drawer position: for drawing what lies under something lifted off it. */
