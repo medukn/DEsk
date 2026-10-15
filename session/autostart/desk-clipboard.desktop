@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=DEsk: Clipboard history
+Comment=Keeps what is copied for Super+V
+Exec=desk-clipboard watch
+TryExec=desk-clipboard
+OnlyShowIn=DEsk;
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

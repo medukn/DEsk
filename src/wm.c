@@ -660,6 +660,9 @@ struct desk_server {
 	int ti_q_head, ti_q_n;
 	struct wl_event_source *ti_timer;
 	struct wl_listener request_set_selection;
+	/* any copy at all, from a program, Xwayland or a clipboard tool:
+	 * who made it, for desk-clipboard (selection_source_note) */
+	struct wl_listener set_selection;
 	struct wl_listener request_set_primary_selection;
 	/* dragging something from one program to another: the thing being
 	 * dragged, drawn under the pointer over everything else */
@@ -16127,6 +16130,13 @@ static bool handle_keybinding(struct desk_server *server, xkb_keysym_t sym, uint
 				console_toggle(server);
 			}
 			return true;
+		case XKB_KEY_v:
+		case XKB_KEY_V:
+			/* what has been copied, to copy one again (desk-clipboard);
+			 * with Shift, keeping what is copied paused or resumed */
+			spawn((mods & WLR_MODIFIER_SHIFT) ? "desk-clipboard incognito toggle"
+				: "desk-clipboard show");
+			return true;
 		case XKB_KEY_n:
 		case XKB_KEY_N:
 			if (!shelf_up(server) && !console_up(server)) {
@@ -19815,6 +19825,65 @@ static void seat_request_set_selection(struct wl_listener *listener, void *data)
 	wlr_seat_set_selection(server->seat, event->source, event->serial);
 }
 
+/* Who copied: the program whose window has the keys when the clipboard
+ * changes -- a copy is made with them, Ctrl+C or a menu. Its names (the
+ * desktop file id, the app id, the X class and instance) go on one line in
+ * $XDG_RUNTIME_DIR/desk-clipboard/source, where desk-clipboard looks before
+ * it keeps a copy, so that what a password manager copies is not kept. A
+ * clipboard tool cannot tell; only the compositor knows. Written before
+ * any of them can have read the new copy. */
+static void seat_set_selection(struct wl_listener *listener, void *data)
+{
+	struct desk_server *server = wl_container_of(listener, server, set_selection);
+	(void)data;
+	const char *run = getenv("XDG_RUNTIME_DIR");
+	if (!run || !*run) {
+		return;
+	}
+	char dir[512], path[600], tmp[620];
+	snprintf(dir, sizeof dir, "%s/desk-clipboard", run);
+	if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+		return;
+	}
+	snprintf(path, sizeof path, "%s/source", dir);
+	snprintf(tmp, sizeof tmp, "%s/.source.new", dir);
+	struct desk_toplevel *view = view_of_surface(server,
+		server->seat->keyboard_state.focused_surface);
+	char id[96] = "";
+	const char *names[4] = { NULL, NULL, NULL, NULL };
+	if (view) {
+		if (view_app_id(view, id, sizeof id)) {
+			names[0] = id;
+		}
+		if (view->xdg_toplevel) {
+			names[1] = view->xdg_toplevel->app_id;
+		}
+#ifdef DESK_HAVE_XWAYLAND
+		if (view->xsurface) {
+			names[2] = view->xsurface->class;
+			names[3] = view->xsurface->instance;
+		}
+#endif
+	}
+	FILE *f = fopen(tmp, "we");
+	if (!f) {
+		return;
+	}
+	for (int i = 0; i < 4; i++) {
+		if (names[i] && *names[i]) {
+			/* one word each: a name with a space in it is not kept whole */
+			for (const char *c = names[i]; *c; c++) {
+				fputc(isspace((unsigned char)*c) ? '_' : *c, f);
+			}
+			fputc(' ', f);
+		}
+	}
+	fputc('\n', f);
+	if (fclose(f) != 0 || rename(tmp, path) != 0) {
+		unlink(tmp);
+	}
+}
+
 /* What was last selected, for a middle click to paste -- the X habit, which
  * Wayland programs keep as well, and which Xwayland carries across. */
 static void seat_request_set_primary_selection(struct wl_listener *listener, void *data)
@@ -23005,6 +23074,8 @@ int main(int argc, char **argv)
 	wl_signal_add(&server.seat->pointer_state.events.focus_change, &server.pointer_focus_change);
 	server.request_set_selection.notify = seat_request_set_selection;
 	wl_signal_add(&server.seat->events.request_set_selection, &server.request_set_selection);
+	server.set_selection.notify = seat_set_selection;
+	wl_signal_add(&server.seat->events.set_selection, &server.set_selection);
 	server.request_set_primary_selection.notify = seat_request_set_primary_selection;
 	wl_signal_add(&server.seat->events.request_set_primary_selection,
 		&server.request_set_primary_selection);
