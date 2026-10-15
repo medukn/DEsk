@@ -43,12 +43,13 @@ c7824c26e80784ca6886a159209c787234667ed59f47c86481583daa680bf8d3  ./include/powe
 8b3196a3820b5857f1664e4cc13386e66cf9cbc8746e212313df27bce51c372a  ./include/session.h
 2cbb569c046ab4be0b5be26795bd32e8724997407f095486a99f7e8ad0ba9895  ./include/sound.h
 c66ceb68f5593ae2fb99a3f849694af74cf9e53173ff734a5038d8d47507cd81  ./include/tray.h
-29b3cbb47e41014116f4482a5504707157eb29598acc1247dcd98ebc4d526de8  ./meson.build
+433c8f3e08ba3017ea2d3fd613e0da466edb9a90d64318dfbc3e67f55fa47792  ./meson.build
 d71a97f44854ceed9b3c1c68506b083ce22099977388599e1eabaed37002deed  ./meson_options.txt
 950ba49090168acdb352ee484939507b8077400d2ba017b1e2d7bb61b2189aa2  ./packaging/debian/desk-desktop.equivs
 65b0f82a6cf129bf1a1c31a2428795abd33886c15ddd5f3ad97e5922d7bdc3a7  ./protocols/wlr-output-management-unstable-v1.xml
 7ebd98f3449d246a57829e4b4dd9fbc3ef98e3dd42fa94ea102f14f490eb20de  ./protocols/wlr-output-power-management-unstable-v1.xml
 84d400c18f7f7804c3a979de2c72b1bdee26da5067add45d2aba79bda16f1be0  ./scripts/check-words.py
+ca13df742264397c2e42170c2d11524bd220a1bb0fded017619b2f59cfbf3596  ./scripts/desk-clipboard
 d45b7f3fb8115abeee25582d8d5ae20c0c48fcc826ca10fc533eec8583a6d5e4  ./scripts/desk-ctl
 075de08ad330e4b5ebc6b409a165efe28c83d2d95e9fc5da50793e0e69d5965a  ./scripts/desk-screenshot
 9da49b18996d5dbf5792f68fd2e1cb5a1f1ee1e26875eff9d154efb68368d837  ./scripts/desk-session-helper
@@ -64,6 +65,7 @@ c837dad21c4e9f13e65a39bf34e82eca1b67322933c0113ae48e7e19edb9111d  ./scripts/inst
 b67e05be75031e67357256792d9e6cbd6dd653330394ae9c29d2fcf72fc11a7e  ./scripts/install_ubuntu.sh
 b6164325cec6f7b2a2328c01ad0daade3d6a3ed26de3eca51007dd2b86028442  ./scripts/room-key.py
 950590bbb80842a602afe00517244207bb7db4b078dd98b6220239e85b07c556  ./scripts/verify.sh
+8400b69426a8dd0aceff87dda46ce0b68b6c132e37eb4346a0ca8294d618b92a  ./session/autostart/desk-clipboard.desktop
 efb1e1e656adf893543970a70e1417942f5df28b7f134a60d022e9291ea7ab8d  ./session/autostart/desk-ime.desktop
 a2a9677ca6c100125ed9b772103b000a7e8ee1051f1b6785b84d964d8fb9df00  ./session/autostart/desk-keyring.desktop
 0cdcd53d5d51b74fc5a48b7538013169f09b4208a8e80b06a76ba036c272cdca  ./session/autostart/desk-media.desktop
@@ -85,7 +87,7 @@ acba4dae966fd50ac09ec46fe4973cc4b0b5bd98556c4d28cca7cebd7cd8f372  ./session/pam/
 5555c2ab93fbc4d9dd0ff637cdf3fd1a540d4892909a8605dc77b7abfbfda2d2  ./src/agenda.c
 47ca497b69c9254adde6d3bf5860011b82577da5a5302ec8b761c9d47e56ced2  ./src/apps.c
 4fce1c348273b780ee8970725ad39ee6c971c49d819af3727ec2392e6217c700  ./src/camera.c
-de05f7f540ecf01eeb6cdd228333adbc33026373ff5b1e697989c41285a4d003  ./src/draw.c
+3ab6e35fc132128072f954b2898ba8e317fa40b92b886903b91bff56ef449fc1  ./src/draw.c
 ebef55712efe22e168926c0e0c5e1a1cb4b02d352e72ef2ec7171adf9666378e  ./src/fonts.c
 34dc7c6e72c43688cf2f17ac844a19baf67da92f18c4c0ea32c42b8587fa950b  ./src/gpu.c
 6fde4f28590405b16bf2ac51284c8f05659a4ea75fa635b6405107ace2dfa148  ./src/gputest.c
@@ -107,7 +109,7 @@ f15abec6131a859b0b917448a55c50f930feb5e9624e8f0e7a97718e53234ec0  ./src/preview.
 c5062fe9f23c69c728ed2505188f2bd5791a9072d1d013a073346dd79110646e  ./src/sound.c
 2c6a618dae877ea979543d050d2073e40513237d6fcf93fd8cbd3450bbf3fbaa  ./src/tray.c
 de0f5d47c568c8d92a27351f3fd585430e799ef86c031a1f21a63e478c57d9a3  ./src/user.c
-bd8f74c879380e959ab8eed5d5a5e868c4ca8dafbb9d9451c8d1d4a8fb079d2f  ./src/wm.c
+410e2e528e12e7c2edf0df328ccf2f0bb4f125e865682f5f9b33766b707b7bf3  ./src/wm.c
 95084c4fdadd53f3e2a2df6b92d261bbb0be395b98844c021320a7a54dbf7fce  ./themes/contact-sheet.py
 ccd7f9403ebc18dc92d8e84cbb112ed43b9ed5af04368a40f0429320d0032b0d  ./themes/gtk/DEsk/gtk-3.0/gtk.css
 9b525da1c9c2ea459b8ec1ab5ae67f324ef6ecf64fded2d40ef653d67387596e  ./themes/gtk/DEsk/index.theme
