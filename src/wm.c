@@ -1179,6 +1179,15 @@ struct desk_server {
 	struct wlr_scene_buffer *fw_node, *confetti_node;
 	char *dump_path;
 	char *screenshot_path;
+	/* Print: a part of the screen chosen first (snip_*) -- dragged out,
+	 * a window clicked, or the whole of it -- and taken once the dimming
+	 * laid over it for the choosing has gone from the screen */
+	bool snip, snip_drag;
+	double snip_x0, snip_y0;
+	struct wlr_scene_tree *snip_tree;
+	struct wlr_scene_rect *snip_dim[4], *snip_edge[4];
+	struct wl_event_source *snip_timer;
+	char snip_cmd[200];
 	int screenshot_delay_ms;
 	int exit_after_shot;
 	struct wl_event_source *tick;
@@ -1716,6 +1725,13 @@ static void server_schedule_frames(struct desk_server *server);
 static void settings_open(void);
 /* more than one screen (see there) */
 static struct wlr_output *first_output(struct desk_server *server);
+static void screenshot_take(struct desk_server *server, bool window);
+static void snip_begin(struct desk_server *server);
+static void process_cursor_motion(struct desk_server *server, uint32_t time);
+static void snip_cancel(struct desk_server *server);
+static bool snip_key(struct desk_server *server, xkb_keysym_t sym);
+static void snip_motion(struct desk_server *server);
+static void snip_button(struct desk_server *server, uint32_t button, bool down);
 static struct wlr_output *screen_at(struct desk_server *server, double x, double y);
 static bool screen_is_side(struct desk_server *server, const struct wlr_output *out);
 static struct wlr_box screen_area(struct desk_server *server, struct wlr_output *out);
@@ -16511,6 +16527,7 @@ static void lock_request(struct desk_server *server)
 	if (locked(server)) {
 		return;
 	}
+	snip_cancel(server);
 	if (desk_gfx_level() <= DESK_GFX_LOW) {
 		/* Low and 2D: no walk out to it, traced as it goes -- the door,
 		 * at once */
@@ -18450,6 +18467,238 @@ static void screenshot_take(struct desk_server *server, bool window)
 	spawn(cmd);
 }
 
+/* ---- Print: choosing what the picture is of ----
+ *
+ * The screen dims and the pointer becomes a crosshair. Dragged out, the
+ * part inside is taken; a click on a window takes that window, paper and
+ * all; a click on the bare desk, or Return, the whole screen it is on.
+ * Esc or the right button lets it be. The dimming is taken away first and
+ * the picture taken a moment later, so it is not in it. */
+
+#define SNIP_EDGE 2
+
+static struct wlr_box snip_extent(struct desk_server *server)
+{
+	struct wlr_box all = { 0 };
+	wlr_output_layout_get_box(server->output_layout, NULL, &all);
+	return all;
+}
+
+/* the dimming around (x, y, w, h), and its edge; w == 0 dims it all */
+static void snip_lay(struct desk_server *server, int x, int y, int w, int h)
+{
+	struct wlr_box a = snip_extent(server);
+	int ax1 = a.x + a.width, ay1 = a.y + a.height;
+	if (w <= 0 || h <= 0) {
+		x = a.x;
+		y = a.y;
+		w = 0;
+		h = 0;
+	}
+	/* above, below, left of, right of the chosen part */
+	int dx[4] = { a.x, a.x, a.x, x + w };
+	int dy[4] = { a.y, y + h, y, y };
+	int dw[4] = { a.width, a.width, x - a.x, ax1 - (x + w) };
+	int dh[4] = { y - a.y, ay1 - (y + h), h, h };
+	if (w == 0) {
+		dh[0] = a.height;
+		dh[1] = dw[2] = dw[3] = 0;
+	}
+	for (int i = 0; i < 4; i++) {
+		wlr_scene_node_set_position(&server->snip_dim[i]->node, dx[i], dy[i]);
+		wlr_scene_rect_set_size(server->snip_dim[i], dw[i] > 0 ? dw[i] : 0,
+			dh[i] > 0 ? dh[i] : 0);
+	}
+	int ex[4] = { x - SNIP_EDGE, x - SNIP_EDGE, x - SNIP_EDGE, x + w };
+	int ey[4] = { y - SNIP_EDGE, y + h, y, y };
+	int ew[4] = { w + 2 * SNIP_EDGE, w + 2 * SNIP_EDGE, SNIP_EDGE, SNIP_EDGE };
+	int eh[4] = { SNIP_EDGE, SNIP_EDGE, h, h };
+	for (int i = 0; i < 4; i++) {
+		wlr_scene_node_set_position(&server->snip_edge[i]->node, ex[i], ey[i]);
+		wlr_scene_rect_set_size(server->snip_edge[i], w > 0 ? ew[i] : 0, w > 0 ? eh[i] : 0);
+	}
+}
+
+static void snip_end(struct desk_server *server)
+{
+	if (!server->snip) {
+		return;
+	}
+	server->snip = false;
+	server->snip_drag = false;
+	if (server->snip_tree) {
+		wlr_scene_node_destroy(&server->snip_tree->node);
+		server->snip_tree = NULL;
+	}
+	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
+	process_cursor_motion(server, 0);
+}
+
+static void snip_cancel(struct desk_server *server)
+{
+	snip_end(server);
+}
+
+static int snip_timer_cb(void *data)
+{
+	struct desk_server *server = data;
+	wl_event_source_remove(server->snip_timer);
+	server->snip_timer = NULL;
+	wlr_log(WLR_INFO, "screenshot: %s", server->snip_cmd);
+	spawn(server->snip_cmd);
+	return 0;
+}
+
+/* taken once the dimming is off the screen: a frame or two from now */
+static void snip_take(struct desk_server *server, int x, int y, int w, int h)
+{
+	snip_end(server);
+	if (w > 0 && h > 0) {
+		snprintf(server->snip_cmd, sizeof server->snip_cmd,
+			"desk-screenshot --geometry '%d,%d %dx%d'", x, y, w, h);
+	} else {
+		snprintf(server->snip_cmd, sizeof server->snip_cmd, "desk-screenshot");
+	}
+	if (server->snip_timer) {
+		return;
+	}
+	server->snip_timer = wl_event_loop_add_timer(
+		wl_display_get_event_loop(server->wl_display), snip_timer_cb, server);
+	if (!server->snip_timer) {
+		spawn(server->snip_cmd);
+		return;
+	}
+	wl_event_source_timer_update(server->snip_timer, 150);
+}
+
+/* the whole of the screen at (x, y) */
+static void snip_take_screen(struct desk_server *server, double x, double y)
+{
+	struct wlr_output *out = screen_at(server, x, y);
+	struct wlr_box box = { 0 };
+	if (out) {
+		wlr_output_layout_get_box(server->output_layout, out, &box);
+	}
+	snip_take(server, box.x, box.y, box.width, box.height);
+}
+
+static void snip_begin(struct desk_server *server)
+{
+	if (server->snip || locked(server) || wl_list_empty(&server->outputs)) {
+		return;
+	}
+	server->snip_tree = wlr_scene_tree_create(&server->scene->tree);
+	if (!server->snip_tree) {
+		screenshot_take(server, false);
+		return;
+	}
+	static const float dim[4] = { 0.0f, 0.0f, 0.0f, 0.45f };
+	static const float edge[4] = { 0.96f, 0.93f, 0.85f, 1.0f };
+	for (int i = 0; i < 4; i++) {
+		server->snip_dim[i] = wlr_scene_rect_create(server->snip_tree, 0, 0, dim);
+		server->snip_edge[i] = wlr_scene_rect_create(server->snip_tree, 0, 0, edge);
+		if (!server->snip_dim[i] || !server->snip_edge[i]) {
+			wlr_scene_node_destroy(&server->snip_tree->node);
+			server->snip_tree = NULL;
+			screenshot_take(server, false);
+			return;
+		}
+	}
+	server->snip = true;
+	server->snip_drag = false;
+	wlr_scene_node_raise_to_top(&server->snip_tree->node);
+	snip_lay(server, 0, 0, 0, 0);
+	wlr_seat_pointer_clear_focus(server->seat);
+	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "crosshair");
+}
+
+/* every key is the snip's while it is up */
+static bool snip_key(struct desk_server *server, xkb_keysym_t sym)
+{
+	if (!server->snip) {
+		return false;
+	}
+	if (sym == XKB_KEY_Escape) {
+		snip_cancel(server);
+	} else if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter || sym == XKB_KEY_space) {
+		snip_take_screen(server, server->cursor->x, server->cursor->y);
+	}
+	return true;
+}
+
+static void snip_rect(struct desk_server *server, int *x, int *y, int *w, int *h)
+{
+	double x0 = server->snip_x0, y0 = server->snip_y0;
+	double x1 = server->cursor->x, y1 = server->cursor->y;
+	*x = (int)floor(x0 < x1 ? x0 : x1);
+	*y = (int)floor(y0 < y1 ? y0 : y1);
+	*w = (int)ceil(fabs(x1 - x0));
+	*h = (int)ceil(fabs(y1 - y0));
+}
+
+static void snip_motion(struct desk_server *server)
+{
+	wlr_seat_pointer_clear_focus(server->seat);
+	if (server->snip_drag) {
+		int x, y, w, h;
+		snip_rect(server, &x, &y, &w, &h);
+		snip_lay(server, x, y, w, h);
+	}
+}
+
+/* the window at (x, y), frontmost first, open on the desk */
+static struct desk_toplevel *snip_view_at(struct desk_server *server, double x, double y)
+{
+	struct desk_toplevel *v;
+	wl_list_for_each(v, &server->toplevels, link) {
+		if (!v->scene_tree || !v->scene_tree->node.enabled || v->unmanaged
+			|| v->sheet.phase != SHEET_IDLE || v->outer_w <= 0 || v->outer_h <= 0) {
+			continue;
+		}
+		int vx = v->scene_tree->node.x, vy = v->scene_tree->node.y;
+		if (x >= vx && y >= vy && x < vx + v->outer_w && y < vy + v->outer_h) {
+			return v;
+		}
+	}
+	return NULL;
+}
+
+static void snip_button(struct desk_server *server, uint32_t button, bool down)
+{
+	if (button == BTN_RIGHT) {
+		if (down) {
+			snip_cancel(server);
+		}
+		return;
+	}
+	if (button != BTN_LEFT) {
+		return;
+	}
+	if (down) {
+		server->snip_drag = true;
+		server->snip_x0 = server->cursor->x;
+		server->snip_y0 = server->cursor->y;
+		return;
+	}
+	if (!server->snip_drag) {
+		return;
+	}
+	int x, y, w, h;
+	snip_rect(server, &x, &y, &w, &h);
+	if (w >= 6 && h >= 6) {
+		snip_take(server, x, y, w, h);
+		return;
+	}
+	/* a click: the window under it, or else the screen */
+	struct desk_toplevel *v = snip_view_at(server, server->cursor->x, server->cursor->y);
+	if (v) {
+		snip_take(server, v->scene_tree->node.x, v->scene_tree->node.y,
+			v->outer_w, v->outer_h);
+	} else {
+		snip_take_screen(server, server->cursor->x, server->cursor->y);
+	}
+}
+
 /* A program asks for one of its windows to be brought to the front -- with
  * a token it got from whatever started it, or from itself. A window folded
  * away is unfolded for it, as clicking its packet would. */
@@ -19129,7 +19378,20 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data)
 	if (sym0 == XKB_KEY_Print || sym0 == XKB_KEY_Sys_Req) {
 		/* (with Alt held, most keymaps call the key SysRq) */
 		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-			screenshot_take(server, (modifiers & WLR_MODIFIER_ALT) != 0);
+			if (modifiers & WLR_MODIFIER_ALT) {
+				screenshot_take(server, true);
+			} else if (server->snip) {
+				snip_cancel(server);
+			} else {
+				snip_begin(server);
+			}
+		}
+		return;
+	}
+	/* while a part of the screen is being chosen, the keys are for that */
+	if (server->snip) {
+		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+			snip_key(server, sym0);
 		}
 		return;
 	}
@@ -19712,6 +19974,10 @@ static void process_cursor_motion(struct desk_server *server, uint32_t time)
 		}
 		return;
 	}
+	if (server->snip) {
+		snip_motion(server);
+		return;
+	}
 	if (server->drag_icon) {
 		wlr_scene_node_set_position(&server->drag_icon->node,
 			(int)server->cursor->x, (int)server->cursor->y);
@@ -19943,6 +20209,11 @@ static void server_cursor_button(struct wl_listener *listener, void *data)
 				server->desk_h, server->cursor->x, server->cursor->y)) {
 			lock_submit(server);
 		}
+		return;
+	}
+	if (server->snip) {
+		snip_button(server, event->button,
+			event->state == WL_POINTER_BUTTON_STATE_PRESSED);
 		return;
 	}
 	if (console_dying(server)) {
